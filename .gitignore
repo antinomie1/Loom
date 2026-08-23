@@ -1,0 +1,5 @@
+/target/
+*.profraw
+*.profdata
+perf.data*
+.DS_Store
