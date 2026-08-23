@@ -48,12 +48,20 @@ impl Fixture {
         fs::write(root.join("etc/group"), format!("tester:x:{gid}:tester\n")).unwrap();
         fs::write(
             root.join("etc/loom/loom.toml"),
-            "# preserved\nschema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\nwants = [\"probe\"]\n",
+            "# preserved\nschema_version = 1\ndefault_group = \"boot\"\nshutdown_group = \"shutdown\"\n[groups.boot]\nwants = [\"probe\"]\n[groups.shutdown]\nwants = [\"save-state\"]\n",
         )
         .unwrap();
         fs::write(
             root.join("etc/loom/services/probe.toml"),
             "schema_version = 1\n[process]\ncommand = [\"/bin/true\"]\ntype = \"oneshot\"\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("etc/loom/services/save-state.toml"),
+            format!(
+                "schema_version = 1\n[process]\ncommand = [\"/usr/bin/touch\", \"{}/saved\"]\ntype = \"oneshot\"\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
+                root.display()
+            ),
         )
         .unwrap();
         Self { root, child: None }
@@ -145,6 +153,19 @@ fn user_manager_starts_service_and_answers_status() {
             let manager = fs::read_to_string(fixture.root.join("etc/loom/loom.toml")).unwrap();
             assert!(manager.contains("# preserved"));
             assert!(!manager.contains("\"probe\""));
+
+            let child = fixture.child.as_mut().unwrap();
+            assert_eq!(
+                Command::new("/bin/kill")
+                    .args(["-TERM", &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .code(),
+                Some(0)
+            );
+            assert!(child.wait().unwrap().success());
+            fixture.child = None;
+            assert!(fixture.root.join("saved").is_file());
             return;
         }
         thread::sleep(Duration::from_millis(10));

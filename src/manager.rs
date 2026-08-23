@@ -61,6 +61,16 @@ pub enum ShutdownAction {
     Poweroff,
 }
 
+struct ShutdownState {
+    action: ShutdownAction,
+    phase: ShutdownPhase,
+}
+
+enum ShutdownPhase {
+    Running(BTreeSet<ServiceId>),
+    Stopping,
+}
+
 #[derive(Clone, Debug)]
 pub struct ManagerOptions {
     pub mode: ManagerMode,
@@ -131,7 +141,7 @@ pub struct Manager {
     deadlines: BinaryHeap<Deadline>,
     next_token: u64,
     next_deadline_sequence: u64,
-    shutdown: Option<ShutdownAction>,
+    shutdown: Option<ShutdownState>,
 }
 
 impl Manager {
@@ -276,15 +286,7 @@ impl Manager {
                 }
             }
             self.complete_pending_clients();
-            if let Some(action) = self.shutdown
-                && self.processes.is_empty()
-                && self.engine.statuses().all(|(_, status)| {
-                    matches!(
-                        status.observed,
-                        ObservedState::Inactive | ObservedState::Failed
-                    )
-                })
-            {
+            if let Some(action) = self.progress_shutdown()? {
                 return Ok(action);
             }
         }
@@ -876,8 +878,11 @@ impl Manager {
             .collect::<BTreeMap<_, _>>();
         let mut memo = BTreeMap::new();
         let best = statuses
-            .keys()
-            .map(|service| critical_path_for(service, self.engine.snapshot(), &statuses, &mut memo))
+            .iter()
+            .filter(|(_, status)| status.ready_at_ms.is_some())
+            .map(|(service, _)| {
+                critical_path_for(service, self.engine.snapshot(), &statuses, &mut memo)
+            })
             .max_by_key(|(duration, _)| *duration)
             .unwrap_or_default();
         let services = best
@@ -932,9 +937,82 @@ impl Manager {
         if self.shutdown.is_some() {
             return Ok(());
         }
-        self.shutdown = Some(action);
-        let effects = self.engine.stop_all();
-        self.apply_effects(effects)
+        let shutdown_group = self.engine.snapshot().shutdown_group().cloned();
+        if let Some(group) = shutdown_group {
+            let pending = self
+                .engine
+                .snapshot()
+                .activation_services(&group)
+                .ok_or_else(|| RuntimeError::UnknownTarget(group.clone()))?
+                .into_iter()
+                .filter(|service| {
+                    self.engine
+                        .status(service)
+                        .is_none_or(|status| status.observed != ObservedState::Active)
+                })
+                .collect();
+            self.shutdown = Some(ShutdownState {
+                action,
+                phase: ShutdownPhase::Running(pending),
+            });
+            let effects = self.engine.start(&group, monotonic_ms()?)?;
+            self.apply_effects(effects)
+        } else {
+            self.shutdown = Some(ShutdownState {
+                action,
+                phase: ShutdownPhase::Stopping,
+            });
+            let effects = self.engine.stop_all();
+            self.apply_effects(effects)
+        }
+    }
+
+    fn progress_shutdown(&mut self) -> Result<Option<ShutdownAction>, ManagerError> {
+        let Some(shutdown) = &self.shutdown else {
+            return Ok(None);
+        };
+        match &shutdown.phase {
+            ShutdownPhase::Running(pending)
+                if pending.iter().all(|service| {
+                    self.engine.status(service).is_some_and(|status| {
+                        status.observed == ObservedState::Failed
+                            || (status.observed == ObservedState::Active
+                                && !self.processes.contains_key(service))
+                    })
+                }) =>
+            {
+                if let Some(shutdown) = &mut self.shutdown {
+                    shutdown.phase = ShutdownPhase::Stopping;
+                }
+                let action = self.shutdown.as_ref().expect("shutdown exists").action;
+                let effects = self.engine.stop_all();
+                self.apply_effects(effects)?;
+                if self.processes.is_empty()
+                    && self.engine.statuses().all(|(_, status)| {
+                        matches!(
+                            status.observed,
+                            ObservedState::Inactive | ObservedState::Failed
+                        )
+                    })
+                {
+                    Ok(Some(action))
+                } else {
+                    Ok(None)
+                }
+            }
+            ShutdownPhase::Stopping
+                if self.processes.is_empty()
+                    && self.engine.statuses().all(|(_, status)| {
+                        matches!(
+                            status.observed,
+                            ObservedState::Inactive | ObservedState::Failed
+                        )
+                    }) =>
+            {
+                Ok(Some(shutdown.action))
+            }
+            _ => Ok(None),
+        }
     }
 
     fn apply_effects(&mut self, effects: Vec<RuntimeEffect>) -> Result<(), ManagerError> {

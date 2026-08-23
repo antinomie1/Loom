@@ -80,15 +80,21 @@ relative descriptors and `openat2` restrictions where available.
 
 ## Groups and enablement
 
-`/etc/loom/loom.toml` declares `default_group` and named groups. User instances
-use `$XDG_CONFIG_HOME/loom/loom.toml`.
+`/etc/loom/loom.toml` declares `default_group`, an optional `shutdown_group`,
+and named groups. PID 1 starts the shutdown group while normal services remain
+available, waits for its newly activated tasks, and then stops all services.
+User instances use `$XDG_CONFIG_HOME/loom/loom.toml`.
 
 ```toml
 schema_version = 1
 default_group = "boot"
+shutdown_group = "shutdown"
 
 [groups.boot]
 wants = ["dbus", "network"]
+
+[groups.shutdown]
+wants = ["save-state"]
 ```
 
 A service is enabled only when directly listed by a group. `enable` edits group

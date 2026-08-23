@@ -26,6 +26,7 @@ pub struct ConfigSnapshot {
     services: BTreeMap<ServiceId, ServiceDefinition>,
     groups: BTreeMap<ServiceId, GroupDefinition>,
     default_group: ServiceId,
+    shutdown_group: Option<ServiceId>,
     max_starting: usize,
     warnings: Vec<ConfigWarning>,
 }
@@ -72,6 +73,12 @@ impl ConfigSnapshot {
         if !groups.contains_key(&default_group) {
             return Err(ConfigError::MissingDefaultGroup(default_group));
         }
+        let shutdown_group = raw.shutdown_group.map(ServiceId::new).transpose()?;
+        if let Some(group) = &shutdown_group
+            && !groups.contains_key(group)
+        {
+            return Err(ConfigError::MissingShutdownGroup(group.clone()));
+        }
 
         let mut services = BTreeMap::new();
         for (id, source) in service_sources {
@@ -92,6 +99,7 @@ impl ConfigSnapshot {
             services,
             groups,
             default_group,
+            shutdown_group,
             max_starting: raw.max_starting,
             warnings,
         })
@@ -110,6 +118,11 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn default_group(&self) -> &ServiceId {
         &self.default_group
+    }
+
+    #[must_use]
+    pub const fn shutdown_group(&self) -> Option<&ServiceId> {
+        self.shutdown_group.as_ref()
     }
 
     #[must_use]
@@ -177,6 +190,8 @@ impl ConfigSnapshot {
 struct RawManagerConfig {
     schema_version: u32,
     default_group: String,
+    #[serde(default)]
+    shutdown_group: Option<String>,
     #[serde(default = "default_max_starting")]
     max_starting: usize,
     groups: BTreeMap<String, RawGroup>,
@@ -417,6 +432,29 @@ requires = ["db"]
                 ServiceId::new("db").unwrap(),
                 ServiceId::new("web").unwrap(),
             ])
+        );
+    }
+
+    #[test]
+    fn validates_optional_shutdown_group() {
+        let source = r#"
+schema_version = 1
+default_group = "boot"
+shutdown_group = "shutdown"
+[groups.boot]
+[groups.shutdown]
+wants = ["save-state"]
+"#;
+        let save_state = service("type = \"oneshot\"");
+        let snapshot = ConfigSnapshot::build(
+            source,
+            [(ServiceId::new("save-state").unwrap(), save_state.as_str())],
+            ManagerScope::System,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.shutdown_group(),
+            Some(&ServiceId::new("shutdown").unwrap())
         );
     }
 

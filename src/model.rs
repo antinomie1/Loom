@@ -399,6 +399,8 @@ pub enum ConfigError {
     AmbiguousDefinition(ServiceId),
     #[error("default group {0} does not exist")]
     MissingDefaultGroup(ServiceId),
+    #[error("shutdown group {0} does not exist")]
+    MissingShutdownGroup(ServiceId),
     #[error("{owner} references missing {relation} target {target}")]
     MissingDependency {
         owner: ServiceId,
