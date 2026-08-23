@@ -48,7 +48,7 @@ impl Fixture {
         fs::write(root.join("etc/group"), format!("tester:x:{gid}:tester\n")).unwrap();
         fs::write(
             root.join("etc/loom/loom.toml"),
-            "schema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\nwants = [\"probe\"]\n",
+            "# preserved\nschema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\nwants = [\"probe\"]\n",
         )
         .unwrap();
         fs::write(
@@ -105,24 +105,40 @@ fn user_manager_starts_service_and_answers_status() {
         thread::sleep(Duration::from_millis(10));
     };
     for request_id in 1..100 {
-        let request = Packet {
-            kind: MessageKind::Request,
-            request_id,
-            operation: Operation::Status,
-            status: StatusCode::Ok,
-            more: false,
-            payload: b"probe".to_vec(),
-        };
-        connection.send(&request.encode().unwrap()).unwrap();
-        let response = Packet::decode(&connection.receive().unwrap().unwrap()).unwrap();
+        let response = request(&connection, request_id, Operation::Status, b"probe");
         assert_eq!(response.status, StatusCode::Ok);
         if String::from_utf8(response.payload)
             .unwrap()
             .contains("probe\tactive")
         {
+            let response = request(&connection, 101, Operation::Disable, b"probe");
+            assert_eq!(response.status, StatusCode::Ok);
+            let response = request(&connection, 102, Operation::IsEnabled, b"probe");
+            assert_eq!(response.status, StatusCode::ServiceFailure);
+            let manager = fs::read_to_string(fixture.root.join("etc/loom/loom.toml")).unwrap();
+            assert!(manager.contains("# preserved"));
+            assert!(!manager.contains("\"probe\""));
             return;
         }
         thread::sleep(Duration::from_millis(10));
     }
     panic!("probe did not become active");
+}
+
+fn request(
+    connection: &SeqPacketConnection,
+    request_id: u64,
+    operation: Operation,
+    payload: &[u8],
+) -> Packet {
+    let request = Packet {
+        kind: MessageKind::Request,
+        request_id,
+        operation,
+        status: StatusCode::Ok,
+        more: false,
+        payload: payload.to_vec(),
+    };
+    connection.send(&request.encode().unwrap()).unwrap();
+    Packet::decode(&connection.receive().unwrap().unwrap()).unwrap()
 }

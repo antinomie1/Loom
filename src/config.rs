@@ -123,6 +123,14 @@ impl ConfigSnapshot {
     }
 
     #[must_use]
+    pub fn is_enabled(&self, service: &ServiceId) -> bool {
+        self.groups.get(&self.default_group).is_some_and(|group| {
+            group.dependencies.requires.contains(service)
+                || group.dependencies.wants.contains(service)
+        })
+    }
+
+    #[must_use]
     pub fn dependencies(&self, id: &ServiceId) -> Option<&Dependencies> {
         self.services
             .get(id)

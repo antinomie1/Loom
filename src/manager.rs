@@ -19,6 +19,8 @@ use std::{
 use thiserror::Error;
 
 use crate::{
+    config::ConfigSnapshot,
+    config_edit::{EditError, atomic_write, edit_enabled},
     identity::{AccountDatabase, IdentityError},
     linux::{
         NotificationRead, ProcessError, SpawnedProcess, current_identity,
@@ -106,6 +108,8 @@ pub enum ManagerError {
     InvalidOptions(&'static str),
     #[error("invalid service target {0:?}")]
     InvalidTarget(String),
+    #[error(transparent)]
+    Edit(#[from] EditError),
 }
 
 pub struct Manager {
@@ -348,7 +352,12 @@ impl Manager {
         }
         match self.dispatch(token, &request) {
             Ok(()) => Ok(()),
-            Err(error @ (ManagerError::Runtime(_) | ManagerError::InvalidTarget(_))) => {
+            Err(
+                error @ (ManagerError::Runtime(_)
+                | ManagerError::InvalidTarget(_)
+                | ManagerError::Config(_)
+                | ManagerError::Edit(_)),
+            ) => {
                 self.respond(
                     token,
                     request.request_id,
@@ -368,19 +377,57 @@ impl Manager {
             Operation::Start | Operation::Stop | Operation::Restart
         ) {
             self.dispatch_lifecycle(token, request)?;
-            self.complete_pending_clients();
-            return Ok(());
+        } else if matches!(
+            request.operation,
+            Operation::Status
+                | Operation::List
+                | Operation::IsActive
+                | Operation::IsEnabled
+                | Operation::Dependencies
+        ) {
+            self.dispatch_query(token, request)?;
+        } else if matches!(
+            request.operation,
+            Operation::Enable
+                | Operation::Disable
+                | Operation::Reload
+                | Operation::Apply
+                | Operation::ResetFailed
+        ) {
+            self.dispatch_configuration(token, request)?;
+        } else if matches!(request.operation, Operation::Reboot | Operation::Poweroff)
+            && self.options.mode == ManagerMode::System
+        {
+            let action = if request.operation == Operation::Reboot {
+                ShutdownAction::Reboot
+            } else {
+                ShutdownAction::Poweroff
+            };
+            self.begin_shutdown(action)?;
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                StatusCode::Ok,
+                b"shutdown started".to_vec(),
+            );
+        } else {
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                StatusCode::InvalidRequest,
+                b"operation is not implemented yet".to_vec(),
+            );
         }
-        match request.operation {
+        self.complete_pending_clients();
+        Ok(())
+    }
+
+    fn dispatch_query(&mut self, token: u64, request: &Packet) -> Result<(), ManagerError> {
+        let (status, payload) = match request.operation {
             Operation::Status | Operation::List => {
-                let payload = self.status_payload(request.payload.as_slice());
-                self.respond(
-                    token,
-                    request.request_id,
-                    request.operation,
-                    StatusCode::Ok,
-                    payload,
-                );
+                (StatusCode::Ok, self.status_payload(&request.payload))
             }
             Operation::IsActive => {
                 let service = payload_target(request)?;
@@ -388,10 +435,7 @@ impl Manager {
                     .engine
                     .status(&service)
                     .is_some_and(|status| status.observed == ObservedState::Active);
-                self.respond(
-                    token,
-                    request.request_id,
-                    request.operation,
+                (
                     if active {
                         StatusCode::Ok
                     } else {
@@ -400,43 +444,83 @@ impl Manager {
                     if active { "active" } else { "inactive" }
                         .as_bytes()
                         .to_vec(),
-                );
+                )
+            }
+            Operation::IsEnabled => {
+                let service = payload_target(request)?;
+                let enabled = self.engine.snapshot().is_enabled(&service);
+                (
+                    if enabled {
+                        StatusCode::Ok
+                    } else {
+                        StatusCode::ServiceFailure
+                    },
+                    if enabled { "enabled" } else { "disabled" }
+                        .as_bytes()
+                        .to_vec(),
+                )
+            }
+            Operation::Dependencies => {
+                let service = payload_target(request)?;
+                let dependencies = self
+                    .engine
+                    .snapshot()
+                    .dependencies(&service)
+                    .ok_or_else(|| RuntimeError::UnknownTarget(service.clone()))?;
+                (
+                    StatusCode::Ok,
+                    format!(
+                        "requires={}\nwants={}\nafter={}\nconflicts={}\n",
+                        join_ids(&dependencies.requires),
+                        join_ids(&dependencies.wants),
+                        join_ids(&dependencies.after),
+                        join_ids(&dependencies.conflicts),
+                    )
+                    .into_bytes(),
+                )
+            }
+            _ => unreachable!("query dispatcher receives query operations"),
+        };
+        self.respond(
+            token,
+            request.request_id,
+            request.operation,
+            status,
+            payload,
+        );
+        Ok(())
+    }
+
+    fn dispatch_configuration(&mut self, token: u64, request: &Packet) -> Result<(), ManagerError> {
+        let payload = match request.operation {
+            Operation::Enable | Operation::Disable => {
+                let (service, now) = enabled_payload(request)?;
+                let enabled = request.operation == Operation::Enable;
+                self.change_enabled(&service, enabled, now)?;
+                if enabled { "enabled" } else { "disabled" }
+                    .as_bytes()
+                    .to_vec()
+            }
+            Operation::Reload | Operation::Apply => {
+                let reconcile = request.operation == Operation::Apply;
+                self.reload_configuration(reconcile)?;
+                if reconcile { "applied" } else { "reloaded" }
+                    .as_bytes()
+                    .to_vec()
             }
             Operation::ResetFailed => {
-                let service = payload_target(request)?;
-                self.engine.reset_failed(&service)?;
-                self.respond(
-                    token,
-                    request.request_id,
-                    request.operation,
-                    StatusCode::Ok,
-                    b"reset".to_vec(),
-                );
+                self.engine.reset_failed(&payload_target(request)?)?;
+                b"reset".to_vec()
             }
-            Operation::Reboot | Operation::Poweroff if self.options.mode == ManagerMode::System => {
-                let action = if request.operation == Operation::Reboot {
-                    ShutdownAction::Reboot
-                } else {
-                    ShutdownAction::Poweroff
-                };
-                self.begin_shutdown(action)?;
-                self.respond(
-                    token,
-                    request.request_id,
-                    request.operation,
-                    StatusCode::Ok,
-                    b"shutdown started".to_vec(),
-                );
-            }
-            _ => self.respond(
-                token,
-                request.request_id,
-                request.operation,
-                StatusCode::InvalidRequest,
-                b"operation is not implemented yet".to_vec(),
-            ),
-        }
-        self.complete_pending_clients();
+            _ => unreachable!("configuration dispatcher receives configuration operations"),
+        };
+        self.respond(
+            token,
+            request.request_id,
+            request.operation,
+            StatusCode::Ok,
+            payload,
+        );
         Ok(())
     }
 
@@ -493,6 +577,104 @@ impl Manager {
             _ => unreachable!("lifecycle dispatcher receives lifecycle operations"),
         }
         Ok(())
+    }
+
+    fn change_enabled(
+        &mut self,
+        service: &ServiceId,
+        enabled: bool,
+        now: bool,
+    ) -> Result<(), ManagerError> {
+        if enabled && !self.engine.snapshot().services().contains_key(service) {
+            return Err(RuntimeError::UnknownTarget(service.clone()).into());
+        }
+        let path = self.manager_config_path()?;
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && self.options.mode == ManagerMode::User =>
+            {
+                "schema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\nwants = []\n"
+                    .to_owned()
+            }
+            Err(error) => return Err(ManagerError::Io(error)),
+        };
+        let edited = edit_enabled(&source, service, enabled)?;
+        let snapshot = self.load_with_manager(&edited)?;
+        let previous = Arc::clone(self.engine.snapshot());
+        self.engine.replace_snapshot(Arc::new(snapshot))?;
+        if let Err(error) = atomic_write(&path, &edited, 0o644) {
+            let _ = self.engine.replace_snapshot(previous);
+            return Err(error.into());
+        }
+        if now {
+            let effects = if enabled {
+                self.engine.start(service, monotonic_ms()?)?
+            } else {
+                self.engine.stop(service)?
+            };
+            self.apply_effects(effects)?;
+        }
+        Ok(())
+    }
+
+    fn reload_configuration(&mut self, reconcile: bool) -> Result<(), ManagerError> {
+        let snapshot = match self.options.mode {
+            ManagerMode::System => ConfigLoader::load_system(&self.options.root)?,
+            ManagerMode::User => ConfigLoader::load_user(
+                &self.options.root,
+                self.options
+                    .config_home
+                    .as_deref()
+                    .ok_or(ManagerError::InvalidOptions(
+                        "user manager requires config_home",
+                    ))?,
+                &self.options.runtime_dir,
+                self.owner_identity.uid,
+            )?,
+        };
+        self.engine.replace_snapshot(Arc::new(snapshot))?;
+        if reconcile {
+            let effects = self.engine.reconcile_default(monotonic_ms()?);
+            self.apply_effects(effects)?;
+        }
+        Ok(())
+    }
+
+    fn load_with_manager(&self, source: &str) -> Result<ConfigSnapshot, ManagerError> {
+        match self.options.mode {
+            ManagerMode::System => Ok(ConfigLoader::load_system_with_manager(
+                &self.options.root,
+                source,
+            )?),
+            ManagerMode::User => Ok(ConfigLoader::load_user_with_manager(
+                &self.options.root,
+                self.options
+                    .config_home
+                    .as_deref()
+                    .ok_or(ManagerError::InvalidOptions(
+                        "user manager requires config_home",
+                    ))?,
+                &self.options.runtime_dir,
+                self.owner_identity.uid,
+                source,
+            )?),
+        }
+    }
+
+    fn manager_config_path(&self) -> Result<PathBuf, ManagerError> {
+        match self.options.mode {
+            ManagerMode::System => Ok(self.options.root.join("etc/loom/loom.toml")),
+            ManagerMode::User => self
+                .options
+                .config_home
+                .as_ref()
+                .map(|home| home.join("loom/loom.toml"))
+                .ok_or(ManagerError::InvalidOptions(
+                    "user manager requires config_home",
+                )),
+        }
     }
 
     fn set_pending(&mut self, token: u64, mut pending: PendingRequest) -> io::Result<()> {
@@ -648,6 +830,11 @@ impl Manager {
                     })?;
                 }
                 libc::SIGCHLD => self.collect_process_exits()?,
+                libc::SIGHUP => {
+                    if let Err(error) = self.reload_configuration(false) {
+                        eprintln!("loom: reload failed: {error}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -659,8 +846,7 @@ impl Manager {
             return Ok(());
         }
         self.shutdown = Some(action);
-        let group = self.engine.snapshot().default_group().clone();
-        let effects = self.engine.stop(&group)?;
+        let effects = self.engine.stop_all();
         self.apply_effects(effects)
     }
 
@@ -1123,11 +1309,30 @@ enum DeadlineAction {
     },
 }
 
+fn enabled_payload(packet: &Packet) -> Result<(ServiceId, bool), ManagerError> {
+    let payload = std::str::from_utf8(&packet.payload).map_err(|_| {
+        ManagerError::InvalidTarget(String::from_utf8_lossy(&packet.payload).into())
+    })?;
+    let (target, now) = payload
+        .strip_prefix("now\n")
+        .map_or((payload, false), |target| (target, true));
+    let service = ServiceId::new(target.trim())
+        .map_err(|_| ManagerError::InvalidTarget(target.to_owned()))?;
+    Ok((service, now))
+}
+
 fn payload_target(packet: &Packet) -> Result<ServiceId, ManagerError> {
     let target = std::str::from_utf8(&packet.payload).map_err(|_| {
         ManagerError::InvalidTarget(String::from_utf8_lossy(&packet.payload).into())
     })?;
     ServiceId::new(target.trim()).map_err(|_| ManagerError::InvalidTarget(target.to_owned()))
+}
+
+fn join_ids(ids: &[ServiceId]) -> String {
+    ids.iter()
+        .map(ServiceId::as_str)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 const fn is_mutating(operation: Operation) -> bool {

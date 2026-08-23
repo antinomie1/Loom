@@ -34,12 +34,14 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let mut runtime_dir = None;
     let mut command = None;
     let mut target = None;
+    let mut now = false;
     while let Some(argument) = parser.next()? {
         match argument {
             Long("user") => user = true,
             Long("system") => user = false,
             Long("root") => root = parser.value()?.into(),
             Long("runtime-dir") => runtime_dir = Some(PathBuf::from(parser.value()?)),
+            Long("now") => now = true,
             Long("help") | Short('h') => {
                 print_help();
                 return Ok(0);
@@ -75,6 +77,9 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     if !needs_target && target.is_some() && operation != Operation::Status {
         return Err("unexpected service name".into());
     }
+    if now && !matches!(operation, Operation::Enable | Operation::Disable) {
+        return Err("--now is valid only with enable or disable".into());
+    }
 
     let runtime_dir = if user {
         runtime_dir
@@ -92,7 +97,14 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         status: StatusCode::Ok,
         more: false,
         payload: target
-            .map(|target| target.to_string_lossy().into_owned().into_bytes())
+            .map(|target| {
+                let target = target.to_string_lossy();
+                if now {
+                    format!("now\n{target}").into_bytes()
+                } else {
+                    target.into_owned().into_bytes()
+                }
+            })
             .unwrap_or_default(),
     };
     connection.send(&request.encode()?)?;

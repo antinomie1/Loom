@@ -53,12 +53,29 @@ impl ConfigLoader {
     /// any schema/graph validation failure.
     pub fn load_system(root: &Path) -> Result<ConfigSnapshot, LoadError> {
         let manager = under(root, "/etc/loom/loom.toml");
-        let layers = [
-            (under(root, "/usr/lib/loom/services"), 0),
-            (under(root, "/etc/loom/services"), 0),
-            (under(root, "/run/loom/services"), 0),
-        ];
-        Self::load(&manager, None, &layers, ManagerScope::System, 0)
+        let layers = system_layers(root);
+        Self::load(&manager, None, &layers, ManagerScope::System, 0, None)
+    }
+
+    /// Validates a proposed system manager document against current service
+    /// layers without writing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load_system`].
+    pub fn load_system_with_manager(
+        root: &Path,
+        manager_source: &str,
+    ) -> Result<ConfigSnapshot, LoadError> {
+        let manager = under(root, "/etc/loom/loom.toml");
+        Self::load(
+            &manager,
+            None,
+            &system_layers(root),
+            ManagerScope::System,
+            0,
+            Some(manager_source),
+        )
     }
 
     /// Loads one user's configuration from validated XDG roots.
@@ -78,17 +95,38 @@ impl ConfigLoader {
     ) -> Result<ConfigSnapshot, LoadError> {
         validate_directory(runtime_dir, uid)?;
         let manager = config_home.join("loom/loom.toml");
-        let layers = [
-            (under(system_root, "/usr/lib/loom/user/services"), 0),
-            (config_home.join("loom/services"), uid),
-            (runtime_dir.join("loom/services"), uid),
-        ];
         Self::load(
             &manager,
             Some(DEFAULT_USER_MANAGER),
-            &layers,
+            &user_layers(system_root, config_home, runtime_dir, uid),
             ManagerScope::User,
             uid,
+            None,
+        )
+    }
+
+    /// Validates a proposed user manager document against current service
+    /// layers without writing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::load_user`].
+    pub fn load_user_with_manager(
+        system_root: &Path,
+        config_home: &Path,
+        runtime_dir: &Path,
+        uid: u32,
+        manager_source: &str,
+    ) -> Result<ConfigSnapshot, LoadError> {
+        validate_directory(runtime_dir, uid)?;
+        let manager = config_home.join("loom/loom.toml");
+        Self::load(
+            &manager,
+            Some(DEFAULT_USER_MANAGER),
+            &user_layers(system_root, config_home, runtime_dir, uid),
+            ManagerScope::User,
+            uid,
+            Some(manager_source),
         )
     }
 
@@ -98,15 +136,22 @@ impl ConfigLoader {
         layers: &[(PathBuf, u32)],
         scope: ManagerScope,
         manager_uid: u32,
+        manager_override: Option<&str>,
     ) -> Result<ConfigSnapshot, LoadError> {
-        let manager = match read_secure_file(manager_path, manager_uid) {
-            Ok(source) => source,
-            Err(LoadError::Inspect { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-                missing_manager_default
-                    .map(str::to_owned)
-                    .ok_or_else(|| LoadError::MissingManager(manager_path.to_path_buf()))?
+        let manager = if let Some(source) = manager_override {
+            source.to_owned()
+        } else {
+            match read_secure_file(manager_path, manager_uid) {
+                Ok(source) => source,
+                Err(LoadError::Inspect { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    missing_manager_default
+                        .map(str::to_owned)
+                        .ok_or_else(|| LoadError::MissingManager(manager_path.to_path_buf()))?
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
 
         let mut sources = BTreeMap::<ServiceId, String>::new();
@@ -142,6 +187,27 @@ impl ConfigLoader {
         )
         .map_err(LoadError::from)
     }
+}
+
+fn system_layers(root: &Path) -> [(PathBuf, u32); 3] {
+    [
+        (under(root, "/usr/lib/loom/services"), 0),
+        (under(root, "/etc/loom/services"), 0),
+        (under(root, "/run/loom/services"), 0),
+    ]
+}
+
+fn user_layers(
+    system_root: &Path,
+    config_home: &Path,
+    runtime_dir: &Path,
+    uid: u32,
+) -> [(PathBuf, u32); 3] {
+    [
+        (under(system_root, "/usr/lib/loom/user/services"), 0),
+        (config_home.join("loom/services"), uid),
+        (runtime_dir.join("loom/services"), uid),
+    ]
 }
 
 fn under(root: &Path, absolute: &str) -> PathBuf {
@@ -283,8 +349,15 @@ mod tests {
             (root.0.join("etc/loom/services"), uid),
         ];
 
-        let snapshot =
-            ConfigLoader::load(&manager_path, None, &layers, ManagerScope::System, uid).unwrap();
+        let snapshot = ConfigLoader::load(
+            &manager_path,
+            None,
+            &layers,
+            ManagerScope::System,
+            uid,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             snapshot.services()[&ServiceId::new("svc").unwrap()]
                 .process
@@ -300,14 +373,14 @@ mod tests {
         let manager_path = root.write("loom.toml", manager());
         fs::set_permissions(&manager_path, fs::Permissions::from_mode(0o664)).unwrap();
         assert!(matches!(
-            ConfigLoader::load(&manager_path, None, &[], ManagerScope::System, uid),
+            ConfigLoader::load(&manager_path, None, &[], ManagerScope::System, uid, None,),
             Err(LoadError::Unsafe { .. })
         ));
 
         let real = root.write("real.toml", manager());
         let linked = root.0.join("linked.toml");
         symlink(real, &linked).unwrap();
-        assert!(ConfigLoader::load(&linked, None, &[], ManagerScope::System, uid).is_err());
+        assert!(ConfigLoader::load(&linked, None, &[], ManagerScope::System, uid, None,).is_err());
         assert_eq!(fs::metadata(&root.0).unwrap().uid(), uid);
     }
 
@@ -321,6 +394,7 @@ mod tests {
             &[],
             ManagerScope::User,
             uid,
+            None,
         )
         .unwrap();
         assert!(snapshot.services().is_empty());

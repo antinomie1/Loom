@@ -116,6 +116,8 @@ pub enum RuntimeError {
     UnknownTarget(ServiceId),
     #[error("operation requires a service, not group {0}")]
     NotService(ServiceId),
+    #[error("reload changes service definitions; use a full apply")]
+    DefinitionChange,
 }
 
 pub struct RuntimeEngine {
@@ -138,6 +140,41 @@ impl RuntimeEngine {
     #[must_use]
     pub fn snapshot(&self) -> &Arc<ConfigSnapshot> {
         &self.snapshot
+    }
+
+    /// Replaces group configuration while retaining all process attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::DefinitionChange`] if any service was added,
+    /// removed, or changed; such changes require the full apply transaction.
+    pub fn replace_snapshot(&mut self, snapshot: Arc<ConfigSnapshot>) -> Result<(), RuntimeError> {
+        if self.snapshot.services() != snapshot.services() {
+            return Err(RuntimeError::DefinitionChange);
+        }
+        self.snapshot = snapshot;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn reconcile_default(&mut self, now_ms: u64) -> Vec<RuntimeEffect> {
+        let enabled = self
+            .snapshot
+            .activation_services(self.snapshot.default_group())
+            .unwrap_or_default();
+        for (service, runtime) in &mut self.services {
+            runtime.desired = if enabled.contains(service) {
+                DesiredState::Active
+            } else {
+                DesiredState::Inactive
+            };
+            if runtime.desired == DesiredState::Active {
+                runtime.restart_blocked = false;
+            }
+        }
+        let mut effects = self.schedule_stops();
+        effects.extend(self.schedule(now_ms));
+        effects
     }
 
     #[must_use]
@@ -243,6 +280,17 @@ impl RuntimeEngine {
             runtime.blocked_by = None;
         }
         Ok(self.schedule_stops())
+    }
+
+    #[must_use]
+    pub fn stop_all(&mut self) -> Vec<RuntimeEffect> {
+        for runtime in self.services.values_mut() {
+            runtime.desired = DesiredState::Inactive;
+            runtime.restart_blocked = false;
+            runtime.waiting_restart = false;
+            runtime.blocked_by = None;
+        }
+        self.schedule_stops()
     }
 
     /// Requests a complete stop followed by a fresh start of one service.
@@ -558,6 +606,7 @@ impl RuntimeEngine {
                 || runtime.observed != ObservedState::Inactive
                 || runtime.restart_blocked
                 || runtime.waiting_restart
+                || !self.conflicts_clear(&service)
             {
                 continue;
             }
@@ -741,6 +790,22 @@ impl RuntimeEngine {
                         )
                 })
             })
+    }
+
+    fn conflicts_clear(&self, service: &ServiceId) -> bool {
+        let conflicts = &self.snapshot.services()[service].dependencies.conflicts;
+        self.services.iter().all(|(other, runtime)| {
+            other == service
+                || matches!(
+                    runtime.observed,
+                    ObservedState::Inactive | ObservedState::Failed
+                )
+                || (!conflicts.contains(other)
+                    && !self.snapshot.services()[other]
+                        .dependencies
+                        .conflicts
+                        .contains(service))
+        })
     }
 
     fn has_stopping_dependent(&self, required: &ServiceId) -> bool {
