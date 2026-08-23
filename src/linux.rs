@@ -3,7 +3,7 @@
 
 use std::{
     collections::BTreeMap,
-    ffi::OsString,
+    ffi::{CString, OsString},
     fs::{File, OpenOptions},
     io,
     os::{
@@ -12,6 +12,7 @@ use std::{
     },
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    time::Duration,
 };
 
 use thiserror::Error;
@@ -102,6 +103,117 @@ pub fn shutdown_system(reboot: bool) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+/// Mounts the kernel API filesystems required by the system manager.
+/// Existing mounts of the expected filesystem type are left untouched.
+///
+/// # Errors
+///
+/// Returns the first directory, `statfs`, or mount failure.
+pub fn mount_api_filesystems() -> io::Result<()> {
+    if !Path::new("/dev/null").exists() {
+        mount_api("devtmpfs", "/dev", "devtmpfs", libc::MS_NOSUID, -1, None)?;
+    }
+    mount_api(
+        "proc",
+        "/proc",
+        "proc",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        0x9fa0,
+        None,
+    )?;
+    mount_api(
+        "sysfs",
+        "/sys",
+        "sysfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        0x6265_6572,
+        None,
+    )?;
+    mount_api(
+        "tmpfs",
+        "/run",
+        "tmpfs",
+        libc::MS_NOSUID | libc::MS_NODEV,
+        0x0102_1994,
+        Some("mode=0755"),
+    )?;
+    std::fs::create_dir_all("/sys/fs/cgroup")?;
+    mount_api(
+        "none",
+        "/sys/fs/cgroup",
+        "cgroup2",
+        libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+        0x6367_7270,
+        None,
+    )
+}
+
+fn mount_api(
+    source: &str,
+    target: &str,
+    filesystem: &str,
+    flags: libc::c_ulong,
+    magic: libc::c_long,
+    data: Option<&str>,
+) -> io::Result<()> {
+    std::fs::create_dir_all(target)?;
+    let target_c = CString::new(target).expect("static mount target has no NUL");
+    let mut status = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: target is a valid NUL-terminated path and status is writable.
+    if unsafe { libc::statfs(target_c.as_ptr(), status.as_mut_ptr()) } == 0 {
+        // SAFETY: statfs initialized status after returning success.
+        if unsafe { status.assume_init() }.f_type == magic {
+            return Ok(());
+        }
+    }
+    let source = CString::new(source).expect("static mount source has no NUL");
+    let filesystem = CString::new(filesystem).expect("static filesystem name has no NUL");
+    let data = data.map(|value| CString::new(value).expect("static mount data has no NUL"));
+    let data_ptr = data
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr().cast());
+    // SAFETY: all strings are NUL-terminated, flags are mount(2) flags, and
+    // the optional data remains alive for the syscall.
+    if unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target_c.as_ptr(),
+            filesystem.as_ptr(),
+            flags,
+            data_ptr,
+        )
+    } == -1
+    {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBUSY) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("mount {filesystem:?} at {target}: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Runs an interactive rescue shell forever. Intended only for PID 1 after a
+/// fatal initialization failure, so PID 1 never exits and panics the kernel.
+pub fn rescue_loop(reason: &str) -> ! {
+    eprintln!("loom: entering rescue mode: {reason}");
+    loop {
+        match Command::new("/bin/sh")
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .spawn()
+        {
+            Ok(mut shell) => {
+                let _ = shell.wait();
+                eprintln!("loom: rescue shell exited; restarting");
+            }
+            Err(error) => eprintln!("loom: cannot start /bin/sh: {error}"),
+        }
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 

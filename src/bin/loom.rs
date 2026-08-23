@@ -5,7 +5,7 @@ use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
 use lexopt::prelude::*;
 use loom::{
     config_edit::atomic_write,
-    linux::shutdown_system,
+    linux::{mount_api_filesystems, rescue_loop, shutdown_system},
     loader::ConfigLoader,
     manager::{Manager, ManagerMode, ManagerOptions, ShutdownAction},
     sage::compile_service,
@@ -14,6 +14,7 @@ use loom::{
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if std::process::id() == 1 => rescue_loop(&error.to_string()),
         Err(error) => {
             eprintln!("loom: {error}");
             ExitCode::FAILURE
@@ -62,6 +63,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             sage_input.as_deref(),
             output.as_deref(),
         );
+    }
+
+    if mode == ManagerMode::System && std::process::id() == 1 && root == std::path::Path::new("/") {
+        mount_api_filesystems()?;
     }
 
     let options = match mode {
