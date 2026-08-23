@@ -14,3 +14,12 @@ on timeout, an early QEMU exit, a missing marker, or rescue mode.
 
 The kernel is intentionally not downloaded by the test. CI and benchmark runs
 must supply the same pinned kernel artifact used by the comparison image.
+
+For diagnosing the comparison side independently, build the minimal systemd
+image from an existing rootfs:
+
+```sh
+tests/qemu/build-systemd-initramfs.sh /mnt/vm-root
+```
+
+The measured same-rootfs pair is produced by `benchmarks/build-images.sh`.

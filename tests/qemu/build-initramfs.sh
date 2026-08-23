@@ -55,7 +55,7 @@ EOF
 cat >"$root/etc/loom/services/boot-ok.toml" <<'EOF'
 schema_version = 1
 [process]
-command = ["/usr/bin/printf", "LOOM_BOOT_OK\\n"]
+command = ["/usr/bin/printf", "LOOM_BOOT_OK\\nBENCHMARK_READY\\n"]
 type = "oneshot"
 [io]
 stdout = "console"
