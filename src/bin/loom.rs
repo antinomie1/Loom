@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: BSD-2-Clause
 
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
 
 use lexopt::prelude::*;
 use loom::{
+    config_edit::atomic_write,
     linux::shutdown_system,
+    loader::ConfigLoader,
     manager::{Manager, ManagerMode, ManagerOptions, ShutdownAction},
+    sage::compile_service,
 };
 
 fn main() -> ExitCode {
@@ -24,6 +27,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut root = PathBuf::from("/");
     let mut config_home = None;
     let mut runtime_dir = None;
+    let mut command = None;
+    let mut sage_input = None;
+    let mut output = None;
     while let Some(argument) = parser.next()? {
         match argument {
             Long("user") => mode = ManagerMode::User,
@@ -31,6 +37,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Long("root") => root = parser.value()?.into(),
             Long("config-home") => config_home = Some(PathBuf::from(parser.value()?)),
             Long("runtime-dir") => runtime_dir = Some(PathBuf::from(parser.value()?)),
+            Long("from-sage") => sage_input = Some(PathBuf::from(parser.value()?)),
+            Long("output") => output = Some(parser.value()?),
             Long("help") | Short('h') => {
                 print_help();
                 return Ok(());
@@ -39,8 +47,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("loom {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
+            Value(value) if command.is_none() => command = Some(value),
             _ => return Err(argument.unexpected().into()),
         }
+    }
+
+    if let Some(command) = command {
+        return run_offline(
+            &command,
+            mode,
+            &root,
+            config_home.as_deref(),
+            runtime_dir.as_deref(),
+            sage_input.as_deref(),
+            output.as_deref(),
+        );
     }
 
     let options = match mode {
@@ -74,10 +95,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn run_offline(
+    command: &OsString,
+    mode: ManagerMode,
+    root: &std::path::Path,
+    config_home: Option<&std::path::Path>,
+    runtime_dir: Option<&std::path::Path>,
+    sage_input: Option<&std::path::Path>,
+    output: Option<&std::ffi::OsStr>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command.to_str() {
+        Some("validate") => {
+            match mode {
+                ManagerMode::System => {
+                    let _ = ConfigLoader::load_system(root)?;
+                }
+                ManagerMode::User => {
+                    let config_home =
+                        config_home.ok_or("validate --user requires --config-home")?;
+                    let runtime_dir =
+                        runtime_dir.ok_or("validate --user requires --runtime-dir")?;
+                    let identity = loom::linux::current_identity()?;
+                    let _ = ConfigLoader::load_user(root, config_home, runtime_dir, identity.uid)?;
+                }
+            }
+            println!("configuration is valid");
+            Ok(())
+        }
+        Some("compile-service") => {
+            let input = sage_input.ok_or("compile-service requires --from-sage FILE")?;
+            let output = output.ok_or("compile-service requires --output FILE or -")?;
+            let compiled = compile_service(&fs::read_to_string(input)?)?;
+            if output == "-" {
+                print!("{}", compiled.toml);
+            } else {
+                atomic_write(&PathBuf::from(output), &compiled.toml, 0o644)?;
+            }
+            Ok(())
+        }
+        _ => Err(format!("unknown loom command {}", command.to_string_lossy()).into()),
+    }
+}
+
 fn print_help() {
     println!(
         "Loom init and service manager\n\n\
-         Usage: loom [--system|--user] [OPTIONS]\n\n\
+         Usage: loom [--system|--user] [OPTIONS]\n       loom validate [--root DIR]\n       loom compile-service --from-sage FILE --output FILE\n\n\
          Options:\n  \
            --root DIR          Alternate system root\n  \
            --config-home DIR   User configuration root\n  \
