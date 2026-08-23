@@ -14,6 +14,8 @@ use std::{
 
 use thiserror::Error;
 
+pub mod reactor;
+
 use crate::model::{OutputTarget, Readiness, ResolvedIdentity, ServiceDefinition};
 
 #[derive(Debug, Error)]
