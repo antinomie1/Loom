@@ -24,7 +24,8 @@ use crate::{
     config_edit::{EditError, atomic_write, edit_enabled},
     identity::{AccountDatabase, IdentityError},
     linux::{
-        NotificationRead, ProcessError, SpawnedProcess, current_identity,
+        CgroupDomain, NotificationRead, ProcessError, SpawnedProcess, current_identity,
+        prepare_cgroup_root,
         reactor::{
             Reactor, SeqPacketConnection, SeqPacketListener, SignalFd, TimerFd, monotonic_ms,
         },
@@ -126,6 +127,7 @@ pub struct Manager {
     sources: HashMap<u64, Source>,
     clients: HashMap<u64, Client>,
     processes: BTreeMap<ServiceId, ProcessSlot>,
+    cgroup_root: Option<PathBuf>,
     deadlines: BinaryHeap<Deadline>,
     next_token: u64,
     next_deadline_sequence: u64,
@@ -191,6 +193,20 @@ impl Manager {
                 .filter(|(key, _)| key != "LOOM_NOTIFY_FD")
                 .collect(),
         };
+        let cgroup_root = if options.root == Path::new("/") {
+            match options.mode {
+                ManagerMode::System => Some(prepare_cgroup_root(true, owner_identity.uid)?),
+                ManagerMode::User => match prepare_cgroup_root(false, owner_identity.uid) {
+                    Ok(root) => Some(root),
+                    Err(error) => {
+                        eprintln!("loom: user cgroups unavailable: {error}");
+                        None
+                    }
+                },
+            }
+        } else {
+            None
+        };
 
         Ok(Self {
             options,
@@ -205,6 +221,7 @@ impl Manager {
             sources: HashMap::new(),
             clients: HashMap::new(),
             processes: BTreeMap::new(),
+            cgroup_root,
             deadlines: BinaryHeap::new(),
             next_token: FIRST_DYNAMIC_TOKEN,
             next_deadline_sequence: 0,
@@ -939,6 +956,11 @@ impl Manager {
                     if let Some(slot) = self.processes.get(&service)
                         && slot.generation == generation
                     {
+                        if let Some(cgroup) = &slot.cgroup
+                            && let Err(error) = cgroup.terminate(force)
+                        {
+                            eprintln!("loom: {service}: cannot signal cgroup: {error}");
+                        }
                         slot.process.terminate(force).map_err(process_io)?;
                     }
                 }
@@ -989,10 +1011,15 @@ impl Manager {
         environment.insert("LOGNAME".into(), account.name);
         environment.insert("SHELL".into(), account.shell);
         let identity = (self.options.mode == ManagerMode::System).then_some(&account.identity);
-        let process = match SpawnedProcess::spawn(definition, identity, &environment) {
-            Ok(process) => process,
+        let cgroup = match self
+            .cgroup_root
+            .as_deref()
+            .map(|root| CgroupDomain::create(root, service.as_str(), generation))
+            .transpose()
+        {
+            Ok(cgroup) => cgroup,
             Err(error) => {
-                eprintln!("loom: {service}: {error}");
+                eprintln!("loom: {service}: cannot create cgroup: {error}");
                 return RuntimeEvent::SpawnFailed {
                     service: service.clone(),
                     generation,
@@ -1000,7 +1027,19 @@ impl Manager {
                 };
             }
         };
-        if let Err(error) = self.register_process(service.clone(), generation, process) {
+        let process =
+            match SpawnedProcess::spawn(definition, identity, &environment, cgroup.as_ref()) {
+                Ok(process) => process,
+                Err(error) => {
+                    eprintln!("loom: {service}: {error}");
+                    return RuntimeEvent::SpawnFailed {
+                        service: service.clone(),
+                        generation,
+                        at_ms: now,
+                    };
+                }
+            };
+        if let Err(error) = self.register_process(service.clone(), generation, process, cgroup) {
             eprintln!("loom: {service}: {error}");
             return RuntimeEvent::SpawnFailed {
                 service: service.clone(),
@@ -1020,6 +1059,7 @@ impl Manager {
         service: ServiceId,
         generation: u64,
         mut process: SpawnedProcess,
+        cgroup: Option<CgroupDomain>,
     ) -> io::Result<()> {
         let pid_token = self.allocate_token();
         if let Err(error) = self.reactor.add(process.pidfd().as_fd(), pid_token, false) {
@@ -1062,6 +1102,7 @@ impl Manager {
                 generation,
                 pid_token,
                 notify_token,
+                cgroup,
             },
         );
         Ok(())
@@ -1167,6 +1208,11 @@ impl Manager {
             if let Some(descriptor) = slot.process.take_notification() {
                 self.reactor.remove(descriptor.as_raw_fd())?;
             }
+        }
+        if let Some(cgroup) = &slot.cgroup
+            && let Err(error) = cgroup.terminate(true)
+        {
+            eprintln!("loom: {service}: cannot clean cgroup: {error}");
         }
         let outcome = if status.success() {
             ExitOutcome::Success
@@ -1289,6 +1335,7 @@ struct ProcessSlot {
     generation: u64,
     pid_token: u64,
     notify_token: Option<u64>,
+    cgroup: Option<CgroupDomain>,
 }
 
 struct PendingRequest {

@@ -10,7 +10,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::Duration,
 };
@@ -217,6 +217,107 @@ pub fn rescue_loop(reason: &str) -> ! {
     }
 }
 
+/// One cgroup v2 process domain owned by a service attempt.
+pub struct CgroupDomain {
+    path: PathBuf,
+    procs: File,
+}
+
+impl CgroupDomain {
+    /// Creates a process domain below a manager-owned cgroup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from directory creation or opening `cgroup.procs`.
+    pub fn create(root: &Path, service: &str, generation: u64) -> io::Result<Self> {
+        let path = root.join(format!("{service}-{generation}"));
+        std::fs::create_dir(&path)?;
+        let procs = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path.join("cgroup.procs"))?;
+        Ok(Self { path, procs })
+    }
+
+    #[must_use]
+    fn procs_fd(&self) -> &File {
+        &self.procs
+    }
+
+    /// Signals every task in the process domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns a cgroup read/write, PID parse, or signal failure.
+    pub fn terminate(&self, force: bool) -> io::Result<()> {
+        let kill_path = self.path.join("cgroup.kill");
+        if force && kill_path.exists() {
+            return std::fs::write(kill_path, b"1");
+        }
+        let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
+        for line in std::fs::read_to_string(self.path.join("cgroup.procs"))?.lines() {
+            let pid = line
+                .parse::<i32>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup PID"))?;
+            // SAFETY: PID came from cgroup.procs and signal is a valid constant.
+            if unsafe { libc::kill(pid, signal) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CgroupDomain {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+/// Creates the manager's cgroup v2 subtree. A user manager succeeds only when
+/// its current cgroup has been delegated by the session owner.
+///
+/// # Errors
+///
+/// Returns an error when cgroup v2 is unavailable or child creation is denied.
+pub fn prepare_cgroup_root(system: bool, uid: u32) -> io::Result<PathBuf> {
+    let mount = Path::new("/sys/fs/cgroup");
+    if !mount.join("cgroup.controllers").is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cgroup v2 is not mounted",
+        ));
+    }
+    let relative = if system {
+        PathBuf::new()
+    } else {
+        let membership = std::fs::read_to_string("/proc/self/cgroup")?;
+        let entry = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing cgroup v2 entry"))?;
+        PathBuf::from(entry.trim_start_matches('/'))
+    };
+    let name = if system {
+        "loom".to_owned()
+    } else {
+        format!("loom-user-{uid}")
+    };
+    let root = mount.join(relative).join(name);
+    std::fs::create_dir_all(&root)?;
+    for entry in std::fs::read_dir(&root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let _ = std::fs::write(path.join("cgroup.kill"), b"1");
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+    Ok(root)
+}
+
 pub struct StartupLock {
     _file: File,
 }
@@ -320,6 +421,7 @@ impl SpawnedProcess {
         definition: &ServiceDefinition,
         identity: Option<&ResolvedIdentity>,
         base_environment: &BTreeMap<String, String>,
+        cgroup: Option<&CgroupDomain>,
     ) -> Result<Self, ProcessError> {
         let mut command = Command::new(&definition.process.command[0]);
         command.args(&definition.process.command[1..]);
@@ -352,6 +454,7 @@ impl SpawnedProcess {
             };
 
         let child_notification_fd = child_notification.as_ref().map(AsRawFd::as_raw_fd);
+        let cgroup_fd = cgroup.map(|domain| domain.procs_fd().as_raw_fd());
         let identity = identity.cloned();
         let umask = definition.process.umask;
         // SAFETY: the closure performs only async-signal-safe libc operations,
@@ -361,6 +464,12 @@ impl SpawnedProcess {
             command.pre_exec(move || {
                 if child_notification_fd.is_some_and(|fd| libc::fcntl(fd, libc::F_SETFD, 0) == -1) {
                     return Err(io::Error::last_os_error());
+                }
+                if let Some(fd) = cgroup_fd {
+                    const SELF_CGROUP: &[u8] = b"0";
+                    if libc::write(fd, SELF_CGROUP.as_ptr().cast(), SELF_CGROUP.len()) != 1 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 libc::umask(umask as libc::mode_t);
                 if let Some(identity) = &identity {
@@ -582,7 +691,7 @@ mod tests {
     #[test]
     fn opens_pidfd_and_reaps_process() {
         let service = definition(&["/bin/sh", "-c", "exit 7"], "exec");
-        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new()).unwrap();
+        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new(), None).unwrap();
 
         assert!(process.pidfd().as_raw_fd() >= 0);
         let status = process.wait().unwrap();
@@ -592,7 +701,7 @@ mod tests {
     #[test]
     fn terminates_whole_service_process_group() {
         let service = definition(&["/bin/sleep", "30"], "exec");
-        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new()).unwrap();
+        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new(), None).unwrap();
 
         process.terminate(true).unwrap();
         let status = process.wait().unwrap();
@@ -605,7 +714,7 @@ mod tests {
             &["/bin/sh", "-c", "eval 'printf READY >&'$LOOM_NOTIFY_FD"],
             "notify",
         );
-        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new()).unwrap();
+        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new(), None).unwrap();
 
         let mut notification = NotificationRead::Pending;
         for _ in 0..100 {
