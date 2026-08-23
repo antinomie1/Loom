@@ -25,8 +25,8 @@ the systemd unit or D-Bus interfaces.
 
 ## Status
 
-Design accepted; implementation has not started. See [the ADR index](docs/adr/README.md)
-and [glossary](docs/GLOSSARY.md).
+Implementation is in progress. See [the ADR index](docs/adr/README.md) and
+[glossary](docs/GLOSSARY.md).
 
 ## License
 
