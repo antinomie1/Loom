@@ -111,9 +111,23 @@ fn user_manager_starts_service_and_answers_status() {
             .unwrap()
             .contains("probe\tactive")
         {
-            let response = request(&connection, 101, Operation::Disable, b"probe");
+            fs::write(
+                fixture.root.join("etc/loom/services/probe.toml"),
+                "schema_version = 1\n[process]\ncommand = [\"/bin/true\", \"--help\"]\ntype = \"oneshot\"\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
+            )
+            .unwrap();
+            let response = request(&connection, 100, Operation::Apply, b"");
             assert_eq!(response.status, StatusCode::Ok);
-            let response = request(&connection, 102, Operation::IsEnabled, b"probe");
+            let response = request(&connection, 101, Operation::Status, b"probe");
+            assert!(
+                String::from_utf8(response.payload)
+                    .unwrap()
+                    .contains("\t2\n")
+            );
+
+            let response = request(&connection, 102, Operation::Disable, b"probe");
+            assert_eq!(response.status, StatusCode::Ok);
+            let response = request(&connection, 103, Operation::IsEnabled, b"probe");
             assert_eq!(response.status, StatusCode::ServiceFailure);
             let manager = fs::read_to_string(fixture.root.join("etc/loom/loom.toml")).unwrap();
             assert!(manager.contains("# preserved"));

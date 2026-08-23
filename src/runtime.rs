@@ -118,11 +118,14 @@ pub enum RuntimeError {
     NotService(ServiceId),
     #[error("reload changes service definitions; use a full apply")]
     DefinitionChange,
+    #[error("another configuration apply is already in progress")]
+    ApplyInProgress,
 }
 
 pub struct RuntimeEngine {
     snapshot: Arc<ConfigSnapshot>,
     services: BTreeMap<ServiceId, ServiceRuntime>,
+    pending_apply: Option<PendingApply>,
 }
 
 impl RuntimeEngine {
@@ -134,7 +137,11 @@ impl RuntimeEngine {
             .cloned()
             .map(|id| (id, ServiceRuntime::default()))
             .collect();
-        Self { snapshot, services }
+        Self {
+            snapshot,
+            services,
+            pending_apply: None,
+        }
     }
 
     #[must_use]
@@ -154,6 +161,68 @@ impl RuntimeEngine {
         }
         self.snapshot = snapshot;
         Ok(())
+    }
+
+    /// Applies a complete snapshot, stopping only changed/removed services and
+    /// their hard dependants before atomically installing new definitions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ApplyInProgress`] when another definition change
+    /// is still stopping affected processes.
+    pub fn apply_snapshot(
+        &mut self,
+        snapshot: Arc<ConfigSnapshot>,
+        now_ms: u64,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        if self.pending_apply.is_some() {
+            return Err(RuntimeError::ApplyInProgress);
+        }
+        let mut affected = self
+            .snapshot
+            .services()
+            .keys()
+            .chain(snapshot.services().keys())
+            .filter(|service| {
+                self.snapshot.services().get(*service) != snapshot.services().get(*service)
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if affected.is_empty() {
+            self.snapshot = snapshot;
+            return Ok(self.reconcile_default(now_ms));
+        }
+        loop {
+            let previous = affected.len();
+            for service in self.snapshot.services().keys() {
+                if self
+                    .required_services(service)
+                    .iter()
+                    .any(|required| affected.contains(required))
+                {
+                    affected.insert(service.clone());
+                }
+            }
+            if affected.len() == previous {
+                break;
+            }
+        }
+        for service in &affected {
+            if let Some(runtime) = self.services.get_mut(service) {
+                runtime.desired = DesiredState::Inactive;
+                runtime.waiting_restart = false;
+                runtime.restart_blocked = false;
+            }
+        }
+        self.pending_apply = Some(PendingApply { snapshot, affected });
+        let mut effects = self.schedule_stops();
+        effects.extend(self.advance_pending_apply(now_ms));
+        Ok(effects)
+    }
+
+    #[must_use]
+    pub const fn apply_pending(&self) -> bool {
+        self.pending_apply.is_some()
     }
 
     #[must_use]
@@ -378,6 +447,7 @@ impl RuntimeEngine {
         effects.extend(self.propagate_dependency_failures());
         effects.extend(self.schedule_stops());
         effects.extend(self.schedule(now_ms));
+        effects.extend(self.advance_pending_apply(now_ms));
         effects
     }
 
@@ -719,6 +789,47 @@ impl RuntimeEngine {
         effects
     }
 
+    fn advance_pending_apply(&mut self, now_ms: u64) -> Vec<RuntimeEffect> {
+        let ready = self.pending_apply.as_ref().is_some_and(|pending| {
+            pending.affected.iter().all(|service| {
+                self.services.get(service).is_none_or(|runtime| {
+                    !runtime.has_process
+                        && matches!(
+                            runtime.observed,
+                            ObservedState::Inactive | ObservedState::Failed
+                        )
+                })
+            })
+        });
+        if !ready {
+            return Vec::new();
+        }
+        let Some(pending) = self.pending_apply.take() else {
+            return Vec::new();
+        };
+        self.services
+            .retain(|service, _| pending.snapshot.services().contains_key(service));
+        for service in pending.snapshot.services().keys() {
+            if pending.affected.contains(service) {
+                let generation = self
+                    .services
+                    .get(service)
+                    .map_or(0, |runtime| runtime.generation);
+                self.services.insert(
+                    service.clone(),
+                    ServiceRuntime {
+                        generation,
+                        ..ServiceRuntime::default()
+                    },
+                );
+            } else {
+                self.services.entry(service.clone()).or_default();
+            }
+        }
+        self.snapshot = pending.snapshot;
+        self.reconcile_default(now_ms)
+    }
+
     fn recover_available_dependencies(&mut self) {
         let recovered = self
             .services
@@ -819,6 +930,11 @@ impl RuntimeEngine {
                 && self.required_services(service).contains(required)
         })
     }
+}
+
+struct PendingApply {
+    snapshot: Arc<ConfigSnapshot>,
+    affected: BTreeSet<ServiceId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1178,6 +1294,44 @@ mod tests {
             at_ms: 104,
         });
         assert!(spawns(&effects, "web").is_some());
+    }
+
+    #[test]
+    fn full_apply_stops_changed_service_before_new_attempt() {
+        let old = simple("");
+        let new = "schema_version = 1\n[process]\ncommand = [\"/bin/false\"]\n".to_owned();
+        let config = snapshot(&[("svc", &old)], &["svc"]);
+        let replacement = snapshot(&[("svc", &new)], &["svc"]);
+        let mut engine = RuntimeEngine::new(config);
+        let effects = engine.start(&ServiceId::new("boot").unwrap(), 0).unwrap();
+        let generation = spawns(&effects, "svc").unwrap();
+        let _ = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: ServiceId::new("svc").unwrap(),
+            generation,
+            at_ms: 1,
+        });
+
+        let effects = engine.apply_snapshot(replacement, 2).unwrap();
+        assert!(engine.apply_pending());
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::Terminate { service, .. } if service.as_str() == "svc"
+        )));
+
+        let effects = engine.handle(RuntimeEvent::Exited {
+            service: ServiceId::new("svc").unwrap(),
+            generation,
+            outcome: ExitOutcome::Signal(15),
+            at_ms: 3,
+        });
+        assert!(!engine.apply_pending());
+        assert!(spawns(&effects, "svc").is_some_and(|next| next > generation));
+        assert_eq!(
+            engine.snapshot().services()[&ServiceId::new("svc").unwrap()]
+                .process
+                .command[0],
+            "/bin/false"
+        );
     }
 
     #[test]

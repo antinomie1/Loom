@@ -501,12 +501,22 @@ impl Manager {
                     .as_bytes()
                     .to_vec()
             }
-            Operation::Reload | Operation::Apply => {
-                let reconcile = request.operation == Operation::Apply;
-                self.reload_configuration(reconcile)?;
-                if reconcile { "applied" } else { "reloaded" }
-                    .as_bytes()
-                    .to_vec()
+            Operation::Reload => {
+                self.reload_configuration(false)?;
+                b"reloaded".to_vec()
+            }
+            Operation::Apply => {
+                self.reload_configuration(true)?;
+                let services = self
+                    .engine
+                    .snapshot()
+                    .activation_services(self.engine.snapshot().default_group())
+                    .unwrap_or_default();
+                self.set_pending(
+                    token,
+                    PendingRequest::apply(request.request_id, request.operation, services),
+                )?;
+                return Ok(());
             }
             Operation::ResetFailed => {
                 self.engine.reset_failed(&payload_target(request)?)?;
@@ -634,10 +644,13 @@ impl Manager {
                 self.owner_identity.uid,
             )?,
         };
-        self.engine.replace_snapshot(Arc::new(snapshot))?;
         if reconcile {
-            let effects = self.engine.reconcile_default(monotonic_ms()?);
+            let effects = self
+                .engine
+                .apply_snapshot(Arc::new(snapshot), monotonic_ms()?)?;
             self.apply_effects(effects)?;
+        } else {
+            self.engine.replace_snapshot(Arc::new(snapshot))?;
         }
         Ok(())
     }
@@ -708,12 +721,14 @@ impl Manager {
 
     fn pending_result(&self, pending: &PendingRequest) -> Option<(StatusCode, Vec<u8>)> {
         match &pending.kind {
-            PendingKind::Start(services) => {
+            PendingKind::Start(services) | PendingKind::Apply(services) => {
                 let statuses = services
                     .iter()
                     .filter_map(|service| self.engine.status(service))
                     .collect::<Vec<_>>();
-                if statuses.iter().any(|status| {
+                if matches!(pending.kind, PendingKind::Apply(_)) && self.engine.apply_pending() {
+                    None
+                } else if statuses.iter().any(|status| {
                     status.observed == ObservedState::Failed && status.blocked_by.is_none()
                 }) {
                     Some((StatusCode::ServiceFailure, b"service failed".to_vec()))
@@ -1238,6 +1253,15 @@ impl PendingRequest {
         }
     }
 
+    fn apply(request_id: u64, operation: Operation, services: BTreeSet<ServiceId>) -> Self {
+        Self {
+            request_id,
+            operation,
+            deadline_ms: 0,
+            kind: PendingKind::Apply(services),
+        }
+    }
+
     fn stop(request_id: u64, operation: Operation, services: BTreeSet<ServiceId>) -> Self {
         Self {
             request_id,
@@ -1267,6 +1291,7 @@ impl PendingRequest {
 
 enum PendingKind {
     Start(BTreeSet<ServiceId>),
+    Apply(BTreeSet<ServiceId>),
     Stop(BTreeSet<ServiceId>),
     Restart {
         service: ServiceId,
