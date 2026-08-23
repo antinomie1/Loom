@@ -9,6 +9,7 @@ repository = "https://github.com/sclinuxdev/loom"
 
 [dependencies]
 libc = "0.2"
+lexopt = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml_edit = { version = "0.23", features = ["serde"] }

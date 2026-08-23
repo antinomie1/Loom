@@ -3,12 +3,14 @@
 
 use std::{
     collections::BTreeMap,
-    fs::OpenOptions,
+    ffi::OsString,
+    fs::{File, OpenOptions},
     io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
     },
+    path::Path,
     process::{Child, Command, ExitStatus, Stdio},
 };
 
@@ -17,6 +19,144 @@ use thiserror::Error;
 pub mod reactor;
 
 use crate::model::{OutputTarget, Readiness, ResolvedIdentity, ServiceDefinition};
+
+/// Returns the calling process's real UID, GID, and supplementary groups.
+///
+/// # Errors
+///
+/// Returns an error when Linux rejects either `getgroups` call.
+pub fn current_identity() -> io::Result<ResolvedIdentity> {
+    // SAFETY: getuid/getgid take no pointers and have no failure return.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // SAFETY: a zero-length getgroups call accepts a null output pointer.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let count =
+        usize::try_from(count).map_err(|_| io::Error::other("group count does not fit usize"))?;
+    let mut supplementary_groups = vec![0_u32; count];
+    if count > 0 {
+        // SAFETY: the vector is writable for `count` gid_t values and Linux
+        // gid_t is u32 on every supported architecture.
+        let result = unsafe {
+            libc::getgroups(
+                i32::try_from(count)
+                    .map_err(|_| io::Error::other("group count does not fit i32"))?,
+                supplementary_groups.as_mut_ptr().cast::<libc::gid_t>(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    supplementary_groups.sort_unstable();
+    supplementary_groups.dedup();
+    Ok(ResolvedIdentity {
+        uid,
+        gid,
+        supplementary_groups,
+    })
+}
+
+/// Reaps one exited child without blocking. This is the PID-1 orphan fallback;
+/// normally tracked children are reaped through their pidfds first.
+///
+/// # Errors
+///
+/// Returns an unexpected `waitpid` error.
+pub fn reap_exited_child() -> io::Result<Option<i32>> {
+    let mut status = 0;
+    // SAFETY: waitpid writes one integer and WNOHANG prevents blocking.
+    let pid = unsafe { libc::waitpid(-1, std::ptr::addr_of_mut!(status), libc::WNOHANG) };
+    match pid.cmp(&0) {
+        std::cmp::Ordering::Greater => Ok(Some(pid)),
+        std::cmp::Ordering::Equal => Ok(None),
+        std::cmp::Ordering::Less => {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ECHILD) {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Flushes filesystem buffers and requests a Linux reboot or poweroff.
+///
+/// # Errors
+///
+/// Returns the Linux error when the reboot syscall returns.
+pub fn shutdown_system(reboot: bool) -> io::Result<()> {
+    // SAFETY: sync has no arguments and only flushes kernel filesystem buffers.
+    unsafe { libc::sync() };
+    let command = if reboot {
+        libc::LINUX_REBOOT_CMD_RESTART
+    } else {
+        libc::LINUX_REBOOT_CMD_POWER_OFF
+    };
+    // SAFETY: reboot receives one documented constant and requires privilege;
+    // successful calls do not return.
+    if unsafe { libc::reboot(command) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub struct StartupLock {
+    _file: File,
+}
+
+impl StartupLock {
+    /// Takes an exclusive advisory lock used to serialize user-manager startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock file cannot be securely opened or locked.
+    pub fn acquire(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        // SAFETY: the file owns a valid descriptor and flock takes scalar flags.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Starts a manager in a new session. The returned child is used only to detect
+/// immediate startup failure; dropping it does not terminate the manager.
+///
+/// # Errors
+///
+/// Returns an error from process creation or the pre-exec `setsid` call.
+pub fn spawn_user_manager(program: &Path, arguments: &[OsString]) -> io::Result<Child> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // SAFETY: setsid is async-signal-safe, takes no pointers, and failures are
+    // reported through Command's exec-error pipe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    command.spawn()
+}
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -161,6 +301,10 @@ impl SpawnedProcess {
     #[must_use]
     pub fn notification_fd(&self) -> Option<&OwnedFd> {
         self.notification.as_ref()
+    }
+
+    pub fn take_notification(&mut self) -> Option<OwnedFd> {
+        self.notification.take()
     }
 
     /// Receives one bounded readiness packet without blocking.

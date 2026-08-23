@@ -27,7 +27,7 @@ pub enum ObservedState {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum TimerKind {
     Start,
     Stop,
@@ -60,6 +60,11 @@ pub enum RuntimeEvent {
         at_ms: u64,
     },
     SpawnFailed {
+        service: ServiceId,
+        generation: u64,
+        at_ms: u64,
+    },
+    ReadinessFailed {
         service: ServiceId,
         generation: u64,
         at_ms: u64,
@@ -138,6 +143,30 @@ impl RuntimeEngine {
     #[must_use]
     pub fn status(&self, service: &ServiceId) -> Option<ServiceStatus> {
         self.services.get(service).map(ServiceRuntime::view)
+    }
+
+    pub fn statuses(&self) -> impl Iterator<Item = (&ServiceId, ServiceStatus)> {
+        self.services
+            .iter()
+            .map(|(service, runtime)| (service, runtime.view()))
+    }
+
+    /// Clears a terminal failure so an explicit start can try again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::UnknownTarget`] for an unknown service.
+    pub fn reset_failed(&mut self, service: &ServiceId) -> Result<(), RuntimeError> {
+        let runtime = self
+            .services
+            .get_mut(service)
+            .ok_or_else(|| RuntimeError::UnknownTarget(service.clone()))?;
+        runtime.restart_blocked = false;
+        runtime.blocked_by = None;
+        if runtime.observed == ObservedState::Failed && !runtime.has_process {
+            runtime.observed = ObservedState::Inactive;
+        }
+        Ok(())
     }
 
     /// Requests activation of a service or group and returns immediate effects.
@@ -259,6 +288,7 @@ impl RuntimeEngine {
             RuntimeEvent::ExecSucceeded { at_ms, .. }
             | RuntimeEvent::Ready { at_ms, .. }
             | RuntimeEvent::SpawnFailed { at_ms, .. }
+            | RuntimeEvent::ReadinessFailed { at_ms, .. }
             | RuntimeEvent::Exited { at_ms, .. }
             | RuntimeEvent::Timer { at_ms, .. } => *at_ms,
         };
@@ -279,6 +309,11 @@ impl RuntimeEngine {
                 generation,
                 at_ms,
             } => self.spawn_failed(&service, generation, at_ms, &mut effects),
+            RuntimeEvent::ReadinessFailed {
+                service,
+                generation,
+                ..
+            } => self.readiness_failed(&service, generation, &mut effects),
             RuntimeEvent::Exited {
                 service,
                 generation,
@@ -336,6 +371,28 @@ impl RuntimeEngine {
         };
         runtime.has_process = false;
         self.finish_unexpected_exit(service, ExitOutcome::ExitCode(127), at_ms, effects);
+    }
+
+    fn readiness_failed(
+        &mut self,
+        service: &ServiceId,
+        generation: u64,
+        effects: &mut Vec<RuntimeEffect>,
+    ) {
+        let stop_timeout_ms = self
+            .snapshot
+            .services()
+            .get(service)
+            .map(|definition| definition.supervision.stop_timeout_ms)
+            .unwrap_or_default();
+        let Some(runtime) = self.current_attempt_mut(service, generation) else {
+            return;
+        };
+        if runtime.observed == ObservedState::Starting {
+            runtime.observed = ObservedState::Stopping;
+            runtime.stop_result = StopResult::RestartFailure;
+            effects.extend(terminate_effects(service, runtime, false, stop_timeout_ms));
+        }
     }
 
     fn exited(

@@ -25,8 +25,20 @@ the systemd unit or D-Bus interfaces.
 
 ## Status
 
-Implementation is in progress. See [the ADR index](docs/adr/README.md) and
-[glossary](docs/GLOSSARY.md).
+Implementation is in progress. Native TOML validation, dependency scheduling,
+pidfd supervision, the epoll manager, user instances, and the local control
+protocol are implemented. PID-1 image tests and Sage integration remain.
+
+```sh
+cargo build --release
+cargo test --all-targets
+
+# User manager is started automatically when needed.
+loomctl --user status
+loomctl --user start example
+```
+
+See [the ADR index](docs/adr/README.md) and [glossary](docs/GLOSSARY.md).
 
 ## License
 

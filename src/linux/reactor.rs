@@ -26,6 +26,28 @@ pub struct ReadyEvent {
     pub hangup: bool,
 }
 
+/// Returns monotonic milliseconds used by runtime deadlines and timestamps.
+///
+/// # Errors
+///
+/// Returns the Linux error from `clock_gettime` or an overflow error.
+pub fn monotonic_ms() -> io::Result<u64> {
+    // SAFETY: timespec is plain data initialized by a successful clock_gettime.
+    let mut time = unsafe { zeroed::<libc::timespec>() };
+    // SAFETY: the output pointer is valid for one timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, std::ptr::addr_of_mut!(time)) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let seconds =
+        u64::try_from(time.tv_sec).map_err(|_| io::Error::other("negative monotonic seconds"))?;
+    let nanoseconds = u64::try_from(time.tv_nsec)
+        .map_err(|_| io::Error::other("negative monotonic nanoseconds"))?;
+    seconds
+        .checked_mul(1000)
+        .and_then(|millis| millis.checked_add(nanoseconds / 1_000_000))
+        .ok_or_else(|| io::Error::other("monotonic milliseconds overflow"))
+}
+
 pub struct Reactor {
     epoll: OwnedFd,
 }
@@ -198,6 +220,34 @@ impl TimerFd {
             },
         };
         // SAFETY: `specification` is initialized and lives for this call.
+        let result = unsafe {
+            libc::timerfd_settime(
+                self.0.as_raw_fd(),
+                0,
+                std::ptr::addr_of!(specification),
+                std::ptr::null_mut(),
+            )
+        };
+        cvt(result)
+    }
+
+    /// Disarms the timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Linux error from `timerfd_settime`.
+    pub fn disarm(&self) -> io::Result<()> {
+        let specification = libc::itimerspec {
+            it_interval: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+            it_value: libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            },
+        };
+        // SAFETY: specification is initialized and lives for this call.
         let result = unsafe {
             libc::timerfd_settime(
                 self.0.as_raw_fd(),
