@@ -28,11 +28,14 @@ the systemd unit or D-Bus interfaces.
 Implementation is in progress. Native TOML validation, dependency scheduling,
 pidfd/cgroup supervision, the epoll manager, user instances, the local control
 protocol, PID-1 API mounts/rescue, and Sage service compilation are implemented.
-PID-1 image tests and the comparative boot benchmark remain.
+A minimal PID-1 QEMU smoke suite is included; the comparative boot benchmark
+and full Sage image fixture remain.
 
 ```sh
 cargo build --release
 cargo test --all-targets
+# With a pinned local kernel:
+tests/qemu/boot.sh /path/to/bzImage
 
 # User manager is started automatically when needed.
 loomctl --user status
