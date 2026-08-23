@@ -14,14 +14,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::model::{OutputTarget, Readiness, ServiceDefinition};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedIdentity {
-    pub uid: u32,
-    pub gid: u32,
-    pub supplementary_groups: Vec<u32>,
-}
+use crate::model::{OutputTarget, Readiness, ResolvedIdentity, ServiceDefinition};
 
 #[derive(Debug, Error)]
 pub enum ProcessError {

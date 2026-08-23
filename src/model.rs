@@ -144,6 +144,25 @@ impl ProcessDefinition {
                 reason: "must be between 0o000 and 0o777".into(),
             });
         }
+        for identity in raw
+            .user
+            .iter()
+            .chain(raw.group.iter())
+            .chain(raw.supplementary_groups.iter())
+        {
+            validate_identity(identity)?;
+        }
+        let mut groups = HashSet::with_capacity(raw.supplementary_groups.len());
+        if raw
+            .supplementary_groups
+            .iter()
+            .any(|group| !groups.insert(group))
+        {
+            return Err(ConfigError::InvalidField {
+                field: "process.supplementary_groups",
+                reason: "duplicate group".into(),
+            });
+        }
         for (key, value) in &raw.environment {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
                 return Err(ConfigError::InvalidField {
@@ -165,21 +184,33 @@ impl ProcessDefinition {
             (ProcessType::Simple, RawReadiness::Notify) => Readiness::Notify,
         };
 
-        let default_identity = || match scope {
-            ManagerScope::System => IdentitySelection::Explicit(IdentitySpec::Name("root".into())),
-            ManagerScope::User => IdentitySelection::Manager,
-        };
+        let user_was_explicit = raw.user.is_some();
+        let user = raw.user.map_or_else(
+            || match scope {
+                ManagerScope::System => {
+                    IdentitySelection::Explicit(IdentitySpec::Name("root".into()))
+                }
+                ManagerScope::User => IdentitySelection::Manager,
+            },
+            IdentitySelection::Explicit,
+        );
+        let group = raw.group.map_or_else(
+            || match scope {
+                ManagerScope::User => IdentitySelection::Manager,
+                ManagerScope::System if user_was_explicit => IdentitySelection::UserPrimary,
+                ManagerScope::System => {
+                    IdentitySelection::Explicit(IdentitySpec::Name("root".into()))
+                }
+            },
+            IdentitySelection::Explicit,
+        );
 
         Ok(Self {
             command: raw.command,
             kind: raw.kind,
             readiness,
-            user: raw
-                .user
-                .map_or_else(default_identity, IdentitySelection::Explicit),
-            group: raw
-                .group
-                .map_or_else(default_identity, IdentitySelection::Explicit),
+            user,
+            group,
             supplementary_groups: raw.supplementary_groups,
             working_directory: raw.working_directory,
             environment: raw.environment,
@@ -202,7 +233,7 @@ pub enum Readiness {
     Completion,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq)]
 #[serde(untagged)]
 pub enum IdentitySpec {
     Name(String),
@@ -212,7 +243,15 @@ pub enum IdentitySpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IdentitySelection {
     Manager,
+    UserPrimary,
     Explicit(IdentitySpec),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedIdentity {
+    pub uid: u32,
+    pub gid: u32,
+    pub supplementary_groups: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -512,6 +551,18 @@ pub(crate) fn require_schema(found: u32) -> Result<(), ConfigError> {
     } else {
         Err(ConfigError::UnsupportedSchema { found })
     }
+}
+
+fn validate_identity(identity: &IdentitySpec) -> Result<(), ConfigError> {
+    if let IdentitySpec::Name(name) = identity
+        && (name.is_empty() || name.contains([':', '\0']))
+    {
+        return Err(ConfigError::InvalidField {
+            field: "process identity",
+            reason: format!("invalid account name {name:?}"),
+        });
+    }
+    Ok(())
 }
 
 fn validate_command(field: &'static str, command: &[String]) -> Result<(), ConfigError> {
