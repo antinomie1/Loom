@@ -3,6 +3,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, VecDeque},
+    fmt::Write as _,
     fs, io,
     os::{
         fd::{AsFd, AsRawFd},
@@ -34,7 +35,7 @@ use crate::{
     protocol::{MessageKind, Operation, Packet, ProtocolError, StatusCode},
     runtime::{
         DesiredState, ExitOutcome, ObservedState, RuntimeEffect, RuntimeEngine, RuntimeError,
-        RuntimeEvent, TimerKind,
+        RuntimeEvent, ServiceStatus, TimerKind,
     },
 };
 
@@ -384,6 +385,8 @@ impl Manager {
                 | Operation::IsActive
                 | Operation::IsEnabled
                 | Operation::Dependencies
+                | Operation::Timings
+                | Operation::CriticalPath
         ) {
             self.dispatch_query(token, request)?;
         } else if matches!(
@@ -479,6 +482,8 @@ impl Manager {
                     .into_bytes(),
                 )
             }
+            Operation::Timings => (StatusCode::Ok, self.timings_payload()),
+            Operation::CriticalPath => (StatusCode::Ok, self.critical_path_payload()),
             _ => unreachable!("query dispatcher receives query operations"),
         };
         self.respond(
@@ -815,6 +820,56 @@ impl Manager {
             output.push('\n');
         }
         output.into_bytes()
+    }
+
+    fn timings_payload(&self) -> Vec<u8> {
+        let statuses = self.engine.statuses().collect::<Vec<_>>();
+        let base = statuses
+            .iter()
+            .filter_map(|(_, status)| status.queued_at_ms)
+            .min()
+            .unwrap_or(0);
+        let mut output =
+            String::from("service\tqueued_ms\tstarted_ms\tready_ms\texited_ms\tstartup_ms\n");
+        for (service, status) in statuses {
+            let startup = status
+                .ready_at_ms
+                .zip(status.started_at_ms)
+                .map(|(ready, started)| ready.saturating_sub(started));
+            writeln!(
+                output,
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                service,
+                relative_time(status.queued_at_ms, base),
+                relative_time(status.started_at_ms, base),
+                relative_time(status.ready_at_ms, base),
+                relative_time(status.exited_at_ms, base),
+                optional_number(startup),
+            )
+            .expect("writing to String cannot fail");
+        }
+        output.into_bytes()
+    }
+
+    fn critical_path_payload(&self) -> Vec<u8> {
+        let statuses = self
+            .engine
+            .statuses()
+            .map(|(service, status)| (service.clone(), status))
+            .collect::<BTreeMap<_, _>>();
+        let mut memo = BTreeMap::new();
+        let best = statuses
+            .keys()
+            .map(|service| critical_path_for(service, self.engine.snapshot(), &statuses, &mut memo))
+            .max_by_key(|(duration, _)| *duration)
+            .unwrap_or_default();
+        let services = best
+            .1
+            .iter()
+            .map(ServiceId::as_str)
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        format!("duration_ms={}\nservices={}\n", best.0, services).into_bytes()
     }
 
     fn may_mutate(&self, token: u64) -> bool {
@@ -1351,6 +1406,44 @@ fn payload_target(packet: &Packet) -> Result<ServiceId, ManagerError> {
         ManagerError::InvalidTarget(String::from_utf8_lossy(&packet.payload).into())
     })?;
     ServiceId::new(target.trim()).map_err(|_| ManagerError::InvalidTarget(target.to_owned()))
+}
+
+fn relative_time(value: Option<u64>, base: u64) -> String {
+    value.map_or_else(
+        || "-".into(),
+        |value| value.saturating_sub(base).to_string(),
+    )
+}
+
+fn optional_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".into(), |value| value.to_string())
+}
+
+fn critical_path_for(
+    service: &ServiceId,
+    snapshot: &ConfigSnapshot,
+    statuses: &BTreeMap<ServiceId, ServiceStatus>,
+    memo: &mut BTreeMap<ServiceId, (u64, Vec<ServiceId>)>,
+) -> (u64, Vec<ServiceId>) {
+    if let Some(path) = memo.get(service) {
+        return path.clone();
+    }
+    let own = statuses
+        .get(service)
+        .and_then(|status| status.ready_at_ms.zip(status.started_at_ms))
+        .map_or(0, |(ready, started)| ready.saturating_sub(started));
+    let mut path = snapshot
+        .dependencies(service)
+        .into_iter()
+        .flat_map(|dependencies| dependencies.requires.iter().chain(&dependencies.after))
+        .filter(|dependency| statuses.contains_key(*dependency))
+        .map(|dependency| critical_path_for(dependency, snapshot, statuses, memo))
+        .max_by_key(|(duration, _)| *duration)
+        .unwrap_or_default();
+    path.0 = path.0.saturating_add(own);
+    path.1.push(service.clone());
+    memo.insert(service.clone(), path.clone());
+    path
 }
 
 fn join_ids(ids: &[ServiceId]) -> String {

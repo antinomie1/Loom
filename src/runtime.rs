@@ -108,6 +108,10 @@ pub struct ServiceStatus {
     pub observed: ObservedState,
     pub generation: u64,
     pub blocked_by: Option<ServiceId>,
+    pub queued_at_ms: Option<u64>,
+    pub started_at_ms: Option<u64>,
+    pub ready_at_ms: Option<u64>,
+    pub exited_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -232,14 +236,18 @@ impl RuntimeEngine {
             .activation_services(self.snapshot.default_group())
             .unwrap_or_default();
         for (service, runtime) in &mut self.services {
-            runtime.desired = if enabled.contains(service) {
+            let desired = if enabled.contains(service) {
                 DesiredState::Active
             } else {
                 DesiredState::Inactive
             };
-            if runtime.desired == DesiredState::Active {
+            if desired == DesiredState::Active {
+                if runtime.desired == DesiredState::Inactive {
+                    runtime.queued_at_ms = Some(now_ms);
+                }
                 runtime.restart_blocked = false;
             }
+            runtime.desired = desired;
         }
         let mut effects = self.schedule_stops();
         effects.extend(self.schedule(now_ms));
@@ -294,6 +302,9 @@ impl RuntimeEngine {
             let Some(runtime) = self.services.get_mut(&service) else {
                 continue;
             };
+            if runtime.desired == DesiredState::Inactive {
+                runtime.queued_at_ms = Some(now_ms);
+            }
             runtime.desired = DesiredState::Active;
             runtime.restart_blocked = false;
             runtime.blocked_by = None;
@@ -386,6 +397,7 @@ impl RuntimeEngine {
             }
         })?;
         runtime.desired = DesiredState::Active;
+        runtime.queued_at_ms = Some(now_ms);
         runtime.restart_blocked = false;
         runtime.blocked_by = None;
 
@@ -414,13 +426,13 @@ impl RuntimeEngine {
             RuntimeEvent::ExecSucceeded {
                 service,
                 generation,
-                ..
-            } => self.exec_succeeded(&service, generation),
+                at_ms,
+            } => self.exec_succeeded(&service, generation, at_ms),
             RuntimeEvent::Ready {
                 service,
                 generation,
-                ..
-            } => self.ready(&service, generation),
+                at_ms,
+            } => self.ready(&service, generation, at_ms),
             RuntimeEvent::SpawnFailed {
                 service,
                 generation,
@@ -451,18 +463,19 @@ impl RuntimeEngine {
         effects
     }
 
-    fn exec_succeeded(&mut self, service: &ServiceId, generation: u64) {
+    fn exec_succeeded(&mut self, service: &ServiceId, generation: u64, at_ms: u64) {
         let readiness = self.snapshot.services()[service].process.readiness;
         let Some(runtime) = self.current_attempt_mut(service, generation) else {
             return;
         };
         if runtime.observed == ObservedState::Starting && readiness == Readiness::Exec {
             runtime.observed = ObservedState::Active;
+            runtime.ready_at_ms = Some(at_ms);
             runtime.blocked_by = None;
         }
     }
 
-    fn ready(&mut self, service: &ServiceId, generation: u64) {
+    fn ready(&mut self, service: &ServiceId, generation: u64, at_ms: u64) {
         let readiness = self
             .snapshot
             .services()
@@ -473,6 +486,7 @@ impl RuntimeEngine {
         };
         if runtime.observed == ObservedState::Starting && readiness == Some(Readiness::Notify) {
             runtime.observed = ObservedState::Active;
+            runtime.ready_at_ms = Some(at_ms);
             runtime.blocked_by = None;
         }
     }
@@ -488,6 +502,7 @@ impl RuntimeEngine {
             return;
         };
         runtime.has_process = false;
+        runtime.exited_at_ms = Some(at_ms);
         self.finish_unexpected_exit(service, ExitOutcome::ExitCode(127), at_ms, effects);
     }
 
@@ -526,6 +541,7 @@ impl RuntimeEngine {
             return;
         };
         runtime.has_process = false;
+        runtime.exited_at_ms = Some(at_ms);
 
         if runtime.observed == ObservedState::Stopping {
             let result = runtime.stop_result;
@@ -547,6 +563,7 @@ impl RuntimeEngine {
             && outcome == ExitOutcome::Success
         {
             runtime.observed = ObservedState::Active;
+            runtime.ready_at_ms = Some(at_ms);
             runtime.restart_history.clear();
             runtime.backoff_ms = INITIAL_RESTART_BACKOFF_MS;
             return;
@@ -576,6 +593,7 @@ impl RuntimeEngine {
 
         if should_restart && register_restart(runtime, definition, at_ms) {
             runtime.observed = ObservedState::Starting;
+            runtime.queued_at_ms = Some(at_ms);
             runtime.waiting_restart = true;
             effects.push(RuntimeEffect::ArmTimer {
                 service: service.clone(),
@@ -706,6 +724,8 @@ impl RuntimeEngine {
             runtime.observed = ObservedState::Starting;
             runtime.has_process = true;
             runtime.started_at_ms = now_ms;
+            runtime.ready_at_ms = None;
+            runtime.exited_at_ms = None;
             runtime.blocked_by = None;
             effects.push(RuntimeEffect::Spawn {
                 service: service.clone(),
@@ -947,7 +967,10 @@ struct ServiceRuntime {
     restart_blocked: bool,
     blocked_by: Option<ServiceId>,
     stop_result: StopResult,
+    queued_at_ms: Option<u64>,
     started_at_ms: u64,
+    ready_at_ms: Option<u64>,
+    exited_at_ms: Option<u64>,
     restart_history: VecDeque<u64>,
     backoff_ms: u64,
 }
@@ -963,7 +986,10 @@ impl Default for ServiceRuntime {
             restart_blocked: false,
             blocked_by: None,
             stop_result: StopResult::Inactive,
+            queued_at_ms: None,
             started_at_ms: 0,
+            ready_at_ms: None,
+            exited_at_ms: None,
             restart_history: VecDeque::new(),
             backoff_ms: INITIAL_RESTART_BACKOFF_MS,
         }
@@ -977,6 +1003,10 @@ impl ServiceRuntime {
             observed: self.observed,
             generation: self.generation,
             blocked_by: self.blocked_by.clone(),
+            queued_at_ms: self.queued_at_ms,
+            started_at_ms: (self.generation > 0).then_some(self.started_at_ms),
+            ready_at_ms: self.ready_at_ms,
+            exited_at_ms: self.exited_at_ms,
         }
     }
 }
@@ -1081,6 +1111,10 @@ mod tests {
         let effects = engine.start(&ServiceId::new("boot").unwrap(), 10).unwrap();
         assert!(spawns(&effects, "a").is_some());
         assert!(spawns(&effects, "b").is_some());
+        let status = engine.status(&ServiceId::new("a").unwrap()).unwrap();
+        assert_eq!(status.queued_at_ms, Some(10));
+        assert_eq!(status.started_at_ms, Some(10));
+        assert_eq!(status.ready_at_ms, None);
     }
 
     #[test]

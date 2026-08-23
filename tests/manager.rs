@@ -111,6 +111,19 @@ fn user_manager_starts_service_and_answers_status() {
             .unwrap()
             .contains("probe\tactive")
         {
+            let timings = request(&connection, 200, Operation::Timings, b"");
+            assert_eq!(timings.status, StatusCode::Ok);
+            let timings = String::from_utf8(timings.payload).unwrap();
+            assert!(timings.starts_with("service\tqueued_ms\tstarted_ms"));
+            assert!(timings.contains("\nprobe\t"));
+            let critical = request(&connection, 201, Operation::CriticalPath, b"");
+            assert_eq!(critical.status, StatusCode::Ok);
+            assert!(
+                String::from_utf8(critical.payload)
+                    .unwrap()
+                    .contains("services=probe")
+            );
+
             fs::write(
                 fixture.root.join("etc/loom/services/probe.toml"),
                 "schema_version = 1\n[process]\ncommand = [\"/bin/true\", \"--help\"]\ntype = \"oneshot\"\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
