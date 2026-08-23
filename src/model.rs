@@ -225,11 +225,21 @@ pub struct Dependencies {
 
 impl Dependencies {
     fn from_raw(raw: RawDependencies, owner: &ServiceId) -> Result<Self, ConfigError> {
+        Self::from_lists(owner, raw.requires, raw.wants, raw.after, raw.conflicts)
+    }
+
+    pub(crate) fn from_lists(
+        owner: &ServiceId,
+        requires: Vec<String>,
+        wants: Vec<String>,
+        after: Vec<String>,
+        conflicts: Vec<String>,
+    ) -> Result<Self, ConfigError> {
         Ok(Self {
-            requires: parse_dependency_list("dependencies.requires", raw.requires, owner)?,
-            wants: parse_dependency_list("dependencies.wants", raw.wants, owner)?,
-            after: parse_dependency_list("dependencies.after", raw.after, owner)?,
-            conflicts: parse_dependency_list("dependencies.conflicts", raw.conflicts, owner)?,
+            requires: parse_dependency_list("dependencies.requires", requires, owner)?,
+            wants: parse_dependency_list("dependencies.wants", wants, owner)?,
+            after: parse_dependency_list("dependencies.after", after, owner)?,
+            conflicts: parse_dependency_list("dependencies.conflicts", conflicts, owner)?,
         })
     }
 }
@@ -344,6 +354,26 @@ pub enum ConfigError {
     UnsupportedSchema { found: u32 },
     #[error("invalid {field}: {reason}")]
     InvalidField { field: &'static str, reason: String },
+    #[error("duplicate definition for {0}")]
+    DuplicateDefinition(ServiceId),
+    #[error("service and group share the identifier {0}")]
+    AmbiguousDefinition(ServiceId),
+    #[error("default group {0} does not exist")]
+    MissingDefaultGroup(ServiceId),
+    #[error("{owner} references missing {relation} target {target}")]
+    MissingDependency {
+        owner: ServiceId,
+        relation: &'static str,
+        target: ServiceId,
+    },
+    #[error("dependency cycle: {}", display_cycle(.0))]
+    DependencyCycle(Vec<ServiceId>),
+    #[error("group {group} activates conflicting nodes {left} and {right}")]
+    EnabledConflict {
+        group: ServiceId,
+        left: ServiceId,
+        right: ServiceId,
+    },
     #[error("invalid TOML: {0}")]
     Toml(#[from] toml_edit::de::Error),
 }
@@ -476,7 +506,7 @@ enum RawOutputName {
     Null,
 }
 
-fn require_schema(found: u32) -> Result<(), ConfigError> {
+pub(crate) fn require_schema(found: u32) -> Result<(), ConfigError> {
     if found == SCHEMA_VERSION {
         Ok(())
     } else {
@@ -576,6 +606,14 @@ const fn default_restart_reset() -> u64 {
 
 const fn default_restart_backoff_max() -> u64 {
     DEFAULT_RESTART_BACKOFF_MAX_MS
+}
+
+fn display_cycle(cycle: &[ServiceId]) -> String {
+    cycle
+        .iter()
+        .map(ServiceId::as_str)
+        .collect::<Vec<_>>()
+        .join(" -> ")
 }
 
 #[cfg(test)]
