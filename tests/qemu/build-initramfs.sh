@@ -37,6 +37,7 @@ mkdir -p "$root"/dev "$root"/proc "$root"/sys "$root"/run \
 copy_program "$repo/target/release/loom" /sbin/init
 copy_program /bin/sh
 copy_program /usr/bin/printf
+copy_file /etc/ld.so.cache
 
 cat >"$root/etc/passwd" <<'EOF'
 root:x:0:0:root:/root:/bin/sh
@@ -64,6 +65,6 @@ EOF
 mkdir -p "$(dirname -- "$output")"
 (
     cd "$root"
-    find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9 >"$output"
+    find . -print0 | cpio --null -o --format=newc --owner=0:0 2>/dev/null | gzip -9 >"$output"
 )
 printf '%s\n' "$output"

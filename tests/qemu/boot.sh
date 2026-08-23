@@ -17,6 +17,7 @@ log=$(mktemp)
 trap 'rm -f "$log"' EXIT INT TERM
 qemu-system-x86_64 \
     -machine accel=kvm:tcg \
+    -cpu host \
     -m 128M \
     -nodefaults \
     -display none \

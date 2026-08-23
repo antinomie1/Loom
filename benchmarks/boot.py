@@ -29,6 +29,7 @@ def run_once(kernel: Path, initramfs: Path, marker: bytes, timeout: float) -> fl
     command = [
         "qemu-system-x86_64",
         "-machine", "accel=kvm:tcg",
+        "-cpu", "host",
         "-m", "128M",
         "-nodefaults",
         "-display", "none",
