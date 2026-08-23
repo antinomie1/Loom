@@ -18,12 +18,9 @@ mapping in C++.
 
 ## Sage service schema
 
-New Recipes use Sage `service.toml` schema v2 with argv arrays and a required,
-non-empty `architectures` array. Canonical values are `amd64`, `aarch64`, and
-`any`; `any` cannot be combined with a concrete architecture. Sage continues to
-read v1 strings through a strict word tokenizer but never executes them as a
-shell; v1 defaults to `architectures = ["any"]` and all existing Recipes migrate
-to v2.
+New Recipes use Sage `service.toml` schema v2 with argv arrays. Sage continues
+to read v1 strings through a strict word tokenizer but never executes them as a
+shell; all existing Recipes migrate to v2.
 
 Installing a package with a service only installs its definition. It does not
 enable or start it. Upgrading an already-enabled service regenerates definitions

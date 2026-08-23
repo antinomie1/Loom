@@ -24,7 +24,6 @@ pub enum SageError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompiledService {
     pub id: ServiceId,
-    pub architectures: Vec<String>,
     pub toml: String,
 }
 
@@ -43,8 +42,6 @@ pub fn compile_service(source: &str) -> Result<CompiledService, SageError> {
     }
     let service = raw.service;
     let id = ServiceId::new(service.name.clone())?;
-    let architectures =
-        validate_architectures(raw.schema_version, service.architectures.as_deref())?;
     if !service.before.is_empty() {
         return Err(SageError::Invalid {
             field: "service.before",
@@ -122,49 +119,7 @@ pub fn compile_service(source: &str) -> Result<CompiledService, SageError> {
     };
     let toml = toml_edit::ser::to_string_pretty(&native)?;
     ServiceDefinition::parse(id.clone(), &toml, ManagerScope::System)?;
-    Ok(CompiledService {
-        id,
-        architectures,
-        toml,
-    })
-}
-
-fn validate_architectures(
-    schema: u32,
-    architectures: Option<&[String]>,
-) -> Result<Vec<String>, SageError> {
-    let architectures = match architectures {
-        Some(architectures) if !architectures.is_empty() => architectures.to_vec(),
-        None if schema == 1 => vec!["any".into()],
-        _ => {
-            return Err(SageError::Invalid {
-                field: "service.architectures",
-                reason: "schema v2 requires a non-empty architecture array".into(),
-            });
-        }
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    for architecture in &architectures {
-        if !matches!(architecture.as_str(), "amd64" | "aarch64" | "any") {
-            return Err(SageError::Invalid {
-                field: "service.architectures",
-                reason: format!("unsupported architecture {architecture:?}"),
-            });
-        }
-        if !seen.insert(architecture.as_str()) {
-            return Err(SageError::Invalid {
-                field: "service.architectures",
-                reason: format!("duplicate architecture {architecture:?}"),
-            });
-        }
-    }
-    if architectures.len() > 1 && seen.contains("any") {
-        return Err(SageError::Invalid {
-            field: "service.architectures",
-            reason: "'any' cannot be combined with concrete architectures".into(),
-        });
-    }
-    Ok(architectures)
+    Ok(CompiledService { id, toml })
 }
 
 fn validate_process_type(process_type: Option<&str>) -> Result<&'static str, SageError> {
@@ -279,7 +234,6 @@ struct RawService {
     conflicts: Vec<String>,
     runtime: Option<String>,
     pid_file: Option<String>,
-    architectures: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -363,7 +317,6 @@ after = ["localmount"]
 schema_version = 2
 [service]
 name = "worker"
-architectures = ["amd64", "aarch64"]
 command = ["/usr/bin/worker", "--foreground"]
 stop_command = ["/usr/bin/workerctl", "stop"]
 readiness = "notify"
@@ -371,7 +324,6 @@ requires = ["db"]
 environment = { MODE = "production" }
 "#;
         let compiled = compile_service(source).unwrap();
-        assert_eq!(compiled.architectures, ["amd64", "aarch64"]);
         assert!(compiled.toml.contains("readiness = \"notify\""));
         assert!(compiled.toml.contains("stop = ["));
     }
@@ -382,7 +334,6 @@ environment = { MODE = "production" }
 schema_version = 2
 [service]
 name = "bad"
-architectures = ["any"]
 command = ["/usr/bin/bad"]
 type = "forking"
 "#;
@@ -390,7 +341,6 @@ type = "forking"
 schema_version = 2
 [service]
 name = "bad"
-architectures = ["any"]
 command = ["/usr/bin/bad"]
 runtime = "runtime/java:21"
 "#;
