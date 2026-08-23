@@ -465,6 +465,16 @@ impl SpawnedProcess {
                 if child_notification_fd.is_some_and(|fd| libc::fcntl(fd, libc::F_SETFD, 0) == -1) {
                     return Err(io::Error::last_os_error());
                 }
+                let mut empty_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+                if libc::sigemptyset(empty_mask.as_mut_ptr()) == -1
+                    || libc::sigprocmask(
+                        libc::SIG_SETMASK,
+                        empty_mask.as_ptr(),
+                        std::ptr::null_mut(),
+                    ) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 if let Some(fd) = cgroup_fd {
                     const SELF_CGROUP: &[u8] = b"0";
                     if libc::write(fd, SELF_CGROUP.as_ptr().cast(), SELF_CGROUP.len()) != 1 {

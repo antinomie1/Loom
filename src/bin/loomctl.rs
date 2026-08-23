@@ -220,7 +220,8 @@ fn print_help() {
     println!(
         "Control Loom services\n\n\
          Usage: loomctl [--system|--user] COMMAND [SERVICE]\n\n\
-         Commands: start stop restart status list is-active reset-failed\n  \
-                   enable disable reload apply reboot poweroff"
+         Commands: start stop restart reload-service status list is-active\n  \
+                   is-enabled dependencies enable disable reload apply\n  \
+                   reset-failed timings critical-path reboot poweroff"
     );
 }

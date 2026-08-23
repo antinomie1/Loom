@@ -48,12 +48,21 @@ impl Fixture {
         fs::write(root.join("etc/group"), format!("tester:x:{gid}:tester\n")).unwrap();
         fs::write(
             root.join("etc/loom/loom.toml"),
-            "# preserved\nschema_version = 1\ndefault_group = \"boot\"\nshutdown_group = \"shutdown\"\n[groups.boot]\nwants = [\"probe\"]\n[groups.shutdown]\nwants = [\"save-state\"]\n",
+            "# preserved\nschema_version = 1\ndefault_group = \"boot\"\nshutdown_group = \"shutdown\"\n[groups.boot]\nwants = [\"probe\", \"reloader\"]\n[groups.shutdown]\nwants = [\"save-state\"]\n",
         )
         .unwrap();
         fs::write(
             root.join("etc/loom/services/probe.toml"),
             "schema_version = 1\n[process]\ncommand = [\"/bin/true\"]\ntype = \"oneshot\"\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("etc/loom/services/reloader.toml"),
+            format!(
+                "schema_version = 1\n[process]\ncommand = [\"/bin/sleep\", \"30\"]\n[actions]\nreload = [\"/usr/bin/touch\", \"{}/reloaded\"]\nstop = [\"/usr/bin/touch\", \"{}/stopped\"]\n[io]\nstdout = \"null\"\nstderr = \"null\"\n",
+                root.display(),
+                root.display()
+            ),
         )
         .unwrap();
         fs::write(
@@ -129,8 +138,11 @@ fn user_manager_starts_service_and_answers_status() {
             assert!(
                 String::from_utf8(critical.payload)
                     .unwrap()
-                    .contains("services=probe")
+                    .contains("services=")
             );
+            let reload = request(&connection, 202, Operation::ReloadService, b"reloader");
+            assert_eq!(reload.status, StatusCode::Ok);
+            assert!(fixture.root.join("reloaded").is_file());
 
             fs::write(
                 fixture.root.join("etc/loom/services/probe.toml"),
@@ -166,6 +178,7 @@ fn user_manager_starts_service_and_answers_status() {
             assert!(child.wait().unwrap().success());
             fixture.child = None;
             assert!(fixture.root.join("saved").is_file());
+            assert!(fixture.root.join("stopped").is_file());
             return;
         }
         thread::sleep(Duration::from_millis(10));

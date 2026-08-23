@@ -32,7 +32,7 @@ use crate::{
         reap_exited_child,
     },
     loader::{ConfigLoader, LoadError},
-    model::{ManagerScope, ResolvedIdentity, ServiceId},
+    model::{ManagerScope, Readiness, ResolvedIdentity, ServiceId},
     protocol::{MessageKind, Operation, Packet, ProtocolError, StatusCode},
     runtime::{
         DesiredState, ExitOutcome, ObservedState, RuntimeEffect, RuntimeEngine, RuntimeError,
@@ -69,6 +69,21 @@ struct ShutdownState {
 enum ShutdownPhase {
     Running(BTreeSet<ServiceId>),
     Stopping,
+}
+
+#[derive(Clone, Copy)]
+enum ServiceAction {
+    Stop,
+    Reload,
+}
+
+impl ServiceAction {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Reload => "reload",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -394,7 +409,7 @@ impl Manager {
     fn dispatch(&mut self, token: u64, request: &Packet) -> Result<(), ManagerError> {
         if matches!(
             request.operation,
-            Operation::Start | Operation::Stop | Operation::Restart
+            Operation::Start | Operation::Stop | Operation::Restart | Operation::ReloadService
         ) {
             self.dispatch_lifecycle(token, request)?;
         } else if matches!(
@@ -607,6 +622,29 @@ impl Manager {
                         generation,
                     ),
                 )?;
+            }
+            Operation::ReloadService => {
+                let service = payload_target(request)?;
+                let success = match self.run_service_action(&service, ServiceAction::Reload) {
+                    Ok(success) => success,
+                    Err(error) => {
+                        eprintln!("loom: {service}: reload action failed: {error}");
+                        false
+                    }
+                };
+                self.respond(
+                    token,
+                    request.request_id,
+                    request.operation,
+                    if success {
+                        StatusCode::Ok
+                    } else {
+                        StatusCode::ServiceFailure
+                    },
+                    if success { "reloaded" } else { "reload failed" }
+                        .as_bytes()
+                        .to_vec(),
+                );
             }
             _ => unreachable!("lifecycle dispatcher receives lifecycle operations"),
         }
@@ -1031,6 +1069,20 @@ impl Manager {
                     generation,
                     force,
                 } => {
+                    if !force
+                        && self.engine.snapshot().services()[&service]
+                            .actions
+                            .stop
+                            .is_some()
+                    {
+                        match self.run_service_action(&service, ServiceAction::Stop) {
+                            Ok(true) => {}
+                            Ok(false) => eprintln!("loom: {service}: stop action failed"),
+                            Err(error) => {
+                                eprintln!("loom: {service}: stop action failed: {error}");
+                            }
+                        }
+                    }
                     if let Some(slot) = self.processes.get(&service)
                         && slot.generation == generation
                     {
@@ -1060,6 +1112,67 @@ impl Manager {
             }
         }
         Ok(())
+    }
+
+    fn run_service_action(
+        &mut self,
+        service: &ServiceId,
+        action: ServiceAction,
+    ) -> Result<bool, ManagerError> {
+        let definition = self
+            .engine
+            .snapshot()
+            .services()
+            .get(service)
+            .ok_or_else(|| RuntimeError::UnknownTarget(service.clone()))?;
+        let command = match action {
+            ServiceAction::Stop => definition.actions.stop.clone(),
+            ServiceAction::Reload => definition.actions.reload.clone(),
+        }
+        .ok_or_else(|| {
+            ManagerError::InvalidTarget(format!("{service} has no {} action", action.name()))
+        })?;
+        let main_pid = self
+            .processes
+            .get(service)
+            .map(|slot| slot.process.pid())
+            .ok_or_else(|| ManagerError::InvalidTarget(format!("{service} is not running")))?;
+        let account = self.accounts.resolve(
+            &definition.process,
+            match self.options.mode {
+                ManagerMode::System => ManagerScope::System,
+                ManagerMode::User => ManagerScope::User,
+            },
+            &self.owner_identity,
+        )?;
+        let mut environment = self.base_environment.clone();
+        environment.insert("HOME".into(), account.home);
+        environment.insert("USER".into(), account.name.clone());
+        environment.insert("LOGNAME".into(), account.name);
+        environment.insert("SHELL".into(), account.shell);
+        environment.insert("LOOM_MAINPID".into(), main_pid.to_string());
+        let identity = (self.options.mode == ManagerMode::System).then_some(&account.identity);
+        let mut action_definition = definition.clone();
+        action_definition.process.command = command;
+        action_definition.process.readiness = Readiness::Exec;
+        let timeout_ms = match action {
+            ServiceAction::Stop => definition.supervision.stop_timeout_ms,
+            ServiceAction::Reload => definition.supervision.start_timeout_ms,
+        };
+        let mut process = SpawnedProcess::spawn(&action_definition, identity, &environment, None)
+            .map_err(process_io)?;
+        let deadline = monotonic_ms()?.saturating_add(timeout_ms);
+        loop {
+            if let Some(status) = process.try_wait().map_err(process_io)? {
+                return Ok(status.success());
+            }
+            if monotonic_ms()? >= deadline {
+                process.terminate(true).map_err(process_io)?;
+                let _ = process.wait().map_err(process_io)?;
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn spawn(&mut self, service: &ServiceId, generation: u64) -> RuntimeEvent {
