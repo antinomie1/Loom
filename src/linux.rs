@@ -202,6 +202,9 @@ fn mount_api(
 /// fatal initialization failure, so PID 1 never exits and panics the kernel.
 pub fn rescue_loop(reason: &str) -> ! {
     eprintln!("loom: entering rescue mode: {reason}");
+    if let Err(error) = clear_signal_mask() {
+        eprintln!("loom: cannot clear rescue signal mask: {error}");
+    }
     loop {
         match Command::new("/bin/sh")
             .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
@@ -218,6 +221,21 @@ pub fn rescue_loop(reason: &str) -> ! {
 }
 
 /// One cgroup v2 process domain owned by a service attempt.
+fn clear_signal_mask() -> io::Result<()> {
+    let mut empty_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: empty_mask is writable and becomes initialized before it is
+    // passed as the input set to sigprocmask.
+    if unsafe { libc::sigemptyset(empty_mask.as_mut_ptr()) } == -1
+        || unsafe {
+            libc::sigprocmask(libc::SIG_SETMASK, empty_mask.as_ptr(), std::ptr::null_mut())
+        } == -1
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub struct CgroupDomain {
     path: PathBuf,
     procs: File,
@@ -465,16 +483,7 @@ impl SpawnedProcess {
                 if child_notification_fd.is_some_and(|fd| libc::fcntl(fd, libc::F_SETFD, 0) == -1) {
                     return Err(io::Error::last_os_error());
                 }
-                let mut empty_mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
-                if libc::sigemptyset(empty_mask.as_mut_ptr()) == -1
-                    || libc::sigprocmask(
-                        libc::SIG_SETMASK,
-                        empty_mask.as_ptr(),
-                        std::ptr::null_mut(),
-                    ) == -1
-                {
-                    return Err(io::Error::last_os_error());
-                }
+                clear_signal_mask()?;
                 if let Some(fd) = cgroup_fd {
                     const SELF_CGROUP: &[u8] = b"0";
                     if libc::write(fd, SELF_CGROUP.as_ptr().cast(), SELF_CGROUP.len()) != 1 {
