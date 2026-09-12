@@ -23,8 +23,10 @@ attempt starts while the previous attempt's helper or descendants remain.
 
 Invalid initial system configuration creates an empty in-memory rescue snapshot.
 The control socket, child reaping, timers and shutdown remain available. Failure
-of a required boot chain also enters rescue, including pre-exec failure; wanted
-service failures alone do not. The failure chain is exposed by status.
+of a required boot chain also enters rescue, including pre-exec failure and a
+required simple service that exits without a restartable attempt. Required boot
+chains remain monitored after initial activation; wanted service failures alone
+do not enter rescue. The failure chain is exposed by status.
 
 `rescue_command` is an absolute argv array in the manager document and defaults
 to `["/bin/sh"]`. Its console session is supervised and retried no more than once
