@@ -24,21 +24,28 @@ use crate::{
     config_edit::{EditError, atomic_write, edit_enabled},
     identity::{AccountDatabase, IdentityError},
     linux::{
-        CgroupDomain, NotificationRead, ProcessError, SpawnedProcess, current_identity,
-        prepare_cgroup_root,
+        CgroupDomain, NotificationRead, ProcessError, SpawnedProcess, become_subreaper,
+        current_identity, prepare_cgroup_root,
         reactor::{
             Reactor, SeqPacketConnection, SeqPacketListener, SignalFd, TimerFd, monotonic_ms,
         },
-        reap_exited_child,
+        reap_untracked_children,
     },
     loader::{ConfigLoader, LoadError},
     model::{ManagerScope, Readiness, ResolvedIdentity, ServiceId},
-    protocol::{MessageKind, Operation, Packet, ProtocolError, StatusCode},
+    protocol::{MessageKind, Operation, Packet, StatusCode},
     runtime::{
         DesiredState, ExitOutcome, ObservedState, RuntimeEffect, RuntimeEngine, RuntimeError,
         RuntimeEvent, ServiceStatus, TimerKind,
     },
 };
+
+mod process;
+mod report;
+mod rescue;
+use process::ActionSlot;
+use report::Report;
+use rescue::RescueState;
 
 const LISTENER_TOKEN: u64 = 1;
 const SIGNAL_TOKEN: u64 = 2;
@@ -71,7 +78,7 @@ enum ShutdownPhase {
     Stopping,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum ServiceAction {
     Stop,
     Reload,
@@ -152,11 +159,14 @@ pub struct Manager {
     sources: HashMap<u64, Source>,
     clients: HashMap<u64, Client>,
     processes: BTreeMap<ServiceId, ProcessSlot>,
+    actions: BTreeMap<u64, ActionSlot>,
     cgroup_root: Option<PathBuf>,
     deadlines: BinaryHeap<Deadline>,
     next_token: u64,
     next_deadline_sequence: u64,
     shutdown: Option<ShutdownState>,
+    rescue: Option<RescueState>,
+    boot_checked: bool,
 }
 
 impl Manager {
@@ -169,20 +179,8 @@ impl Manager {
     /// directories, or Linux descriptor/socket setup failure.
     pub fn new(options: ManagerOptions) -> Result<Self, ManagerError> {
         let owner_identity = current_identity()?;
-        let snapshot = match options.mode {
-            ManagerMode::System => ConfigLoader::load_system(&options.root)?,
-            ManagerMode::User => ConfigLoader::load_user(
-                &options.root,
-                options
-                    .config_home
-                    .as_deref()
-                    .ok_or(ManagerError::InvalidOptions(
-                        "user manager requires config_home",
-                    ))?,
-                &options.runtime_dir,
-                owner_identity.uid,
-            )?,
-        };
+        become_subreaper()?;
+        let (snapshot, initial_failure) = initial_snapshot(&options, &owner_identity)?;
         let accounts = AccountDatabase::load(&options.root)?;
         let socket_directory = control_directory(&options);
         create_control_directory(&socket_directory, options.mode, owner_identity.uid)?;
@@ -246,11 +244,18 @@ impl Manager {
             sources: HashMap::new(),
             clients: HashMap::new(),
             processes: BTreeMap::new(),
+            actions: BTreeMap::new(),
             cgroup_root,
             deadlines: BinaryHeap::new(),
             next_token: FIRST_DYNAMIC_TOKEN,
             next_deadline_sequence: 0,
             shutdown: None,
+            rescue: initial_failure.map(|reason| RescueState {
+                reason,
+                process: None,
+                recovering: false,
+            }),
+            boot_checked: false,
         })
     }
 
@@ -264,10 +269,38 @@ impl Manager {
     pub fn run(mut self) -> Result<ShutdownAction, ManagerError> {
         let now = monotonic_ms()?;
         let default_group = self.engine.snapshot().default_group().clone();
-        let effects = self.engine.start(&default_group, now)?;
-        self.apply_effects(effects)?;
+        if let Some(state) = &self.rescue {
+            eprintln!("loom: entering rescue mode: {}", state.reason);
+            self.start_rescue()?;
+        } else {
+            let effects = self.engine.start(&default_group, now)?;
+            self.apply_effects(effects)?;
+        }
 
         loop {
+            if self.options.mode == ManagerMode::System && self.rescue.is_none() {
+                if let Some(chain) = self.engine.boot_failure() {
+                    self.enter_rescue(format!("required boot chain failed: {chain}"))?;
+                    self.boot_checked = true;
+                } else if !self.boot_checked
+                    && self
+                        .engine
+                        .snapshot()
+                        .activation_services(self.engine.snapshot().default_group())
+                        .is_some_and(|services| {
+                            services.iter().all(|id| {
+                                self.engine.status(id).is_some_and(|status| {
+                                    matches!(
+                                        status.observed,
+                                        ObservedState::Active | ObservedState::Failed
+                                    )
+                                })
+                            })
+                        })
+                {
+                    self.boot_checked = true;
+                }
+            }
             for event in self.reactor.wait(None)? {
                 let source = match event.token {
                     LISTENER_TOKEN => Some(Source::Listener),
@@ -285,10 +318,17 @@ impl Manager {
                     Source::Client(token) => {
                         if event.hangup {
                             self.remove_client(token);
-                        } else if event.readable {
-                            self.handle_client(token)?;
+                        } else {
+                            if event.writable {
+                                self.flush_client(token);
+                            }
+                            if event.readable {
+                                self.handle_client(token)?;
+                            }
                         }
                     }
+                    Source::Rescue => self.poll_rescue()?,
+                    Source::Action(id) => self.handle_action_exit(id)?,
                     Source::Process {
                         service,
                         generation,
@@ -322,6 +362,8 @@ impl Manager {
                     connection,
                     credentials_uid: credentials.uid,
                     pending: None,
+                    format_toml: false,
+                    outgoing: VecDeque::new(),
                 },
             );
         }
@@ -338,29 +380,38 @@ impl Manager {
         let Some(encoded) = packet else {
             return Ok(());
         };
-        let request = match Packet::decode(&encoded) {
-            Ok(request) if request.kind == MessageKind::Request => request,
-            Ok(_) => {
-                self.respond(
-                    token,
-                    0,
-                    Operation::Status,
-                    StatusCode::InvalidRequest,
-                    b"expected request packet".to_vec(),
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                self.respond(
-                    token,
-                    0,
-                    Operation::Status,
-                    StatusCode::InvalidRequest,
-                    error.to_string().into_bytes(),
-                );
-                return Ok(());
-            }
+        let Some(mut request) = self.decode_request(token, &encoded) else {
+            return Ok(());
         };
+        let format_toml = request.payload.starts_with(b"toml\n");
+        if format_toml {
+            request.payload.drain(..5);
+        }
+        if let Some(client) = self.clients.get_mut(&token) {
+            client.format_toml = format_toml;
+        }
+        if self.shutdown.is_some() && is_mutating(request.operation) {
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                StatusCode::Conflict,
+                b"shutdown in progress".to_vec(),
+            );
+            return Ok(());
+        }
+        if self.engine.apply_pending()
+            && (is_mutating(request.operation) || request.operation == Operation::ApplyDryRun)
+        {
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                StatusCode::Conflict,
+                b"apply in progress".to_vec(),
+            );
+            return Ok(());
+        }
         if self
             .clients
             .get(&token)
@@ -385,31 +436,62 @@ impl Manager {
             );
             return Ok(());
         }
-        match self.dispatch(token, &request) {
-            Ok(()) => Ok(()),
-            Err(
-                error @ (ManagerError::Runtime(_)
-                | ManagerError::InvalidTarget(_)
-                | ManagerError::Config(_)
-                | ManagerError::Edit(_)),
-            ) => {
+        if let Err(error) = self.dispatch(token, &request) {
+            let status = match &error {
+                ManagerError::Runtime(RuntimeError::UnknownTarget(_))
+                | ManagerError::InvalidTarget(_) => StatusCode::NotFound,
+                ManagerError::Runtime(RuntimeError::ApplyInProgress) => StatusCode::Conflict,
+                ManagerError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    StatusCode::PermissionDenied
+                }
+                ManagerError::Io(_) | ManagerError::Edit(_) => StatusCode::Internal,
+                _ => StatusCode::InvalidRequest,
+            };
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                status,
+                error.to_string().into_bytes(),
+            );
+        }
+        Ok(())
+    }
+
+    fn decode_request(&mut self, token: u64, encoded: &[u8]) -> Option<Packet> {
+        match Packet::decode(encoded) {
+            Ok(request) if request.kind == MessageKind::Request => Some(request),
+            Ok(_) => {
                 self.respond(
                     token,
-                    request.request_id,
-                    request.operation,
-                    StatusCode::NotFound,
+                    0,
+                    Operation::Status,
+                    StatusCode::InvalidRequest,
+                    b"expected request packet".to_vec(),
+                );
+                None
+            }
+            Err(error) => {
+                self.respond(
+                    token,
+                    0,
+                    Operation::Status,
+                    StatusCode::InvalidRequest,
                     error.to_string().into_bytes(),
                 );
-                Ok(())
+                None
             }
-            Err(error) => Err(error),
         }
     }
 
     fn dispatch(&mut self, token: u64, request: &Packet) -> Result<(), ManagerError> {
         if matches!(
             request.operation,
-            Operation::Start | Operation::Stop | Operation::Restart | Operation::ReloadService
+            Operation::Start
+                | Operation::Stop
+                | Operation::StopForce
+                | Operation::Restart
+                | Operation::ReloadService
         ) {
             self.dispatch_lifecycle(token, request)?;
         } else if matches!(
@@ -429,6 +511,7 @@ impl Manager {
                 | Operation::Disable
                 | Operation::Reload
                 | Operation::Apply
+                | Operation::ApplyDryRun
                 | Operation::ResetFailed
         ) {
             self.dispatch_configuration(token, request)?;
@@ -520,22 +603,88 @@ impl Manager {
             Operation::CriticalPath => (StatusCode::Ok, self.critical_path_payload()),
             _ => unreachable!("query dispatcher receives query operations"),
         };
-        self.respond(
-            token,
-            request.request_id,
-            request.operation,
-            status,
-            payload,
-        );
+        if self
+            .clients
+            .get(&token)
+            .is_some_and(|client| client.format_toml)
+        {
+            self.respond_report(
+                token,
+                request.request_id,
+                request.operation,
+                status,
+                self.query_report(request.operation, &request.payload),
+            );
+        } else {
+            self.respond(
+                token,
+                request.request_id,
+                request.operation,
+                status,
+                payload,
+            );
+        }
         Ok(())
     }
 
     fn dispatch_configuration(&mut self, token: u64, request: &Packet) -> Result<(), ManagerError> {
+        if request.operation == Operation::ApplyDryRun {
+            let snapshot = self.load_snapshot()?;
+            self.validate_accounts(&snapshot)?;
+            let plan = self.engine.plan_snapshot(&snapshot);
+            if self
+                .clients
+                .get(&token)
+                .is_some_and(|client| client.format_toml)
+            {
+                self.respond_report(
+                    token,
+                    request.request_id,
+                    request.operation,
+                    StatusCode::Ok,
+                    Report {
+                        plan: Some(plan),
+                        ..Report::default()
+                    },
+                );
+            } else {
+                let payload = toml_edit::ser::to_string(&plan).map_err(io::Error::other)?;
+                self.respond(
+                    token,
+                    request.request_id,
+                    request.operation,
+                    StatusCode::Ok,
+                    payload.into_bytes(),
+                );
+            }
+            return Ok(());
+        }
         let payload = match request.operation {
             Operation::Enable | Operation::Disable => {
                 let (service, now) = enabled_payload(request)?;
                 let enabled = request.operation == Operation::Enable;
                 self.change_enabled(&service, enabled, now)?;
+                if now {
+                    let services = if enabled {
+                        self.engine
+                            .snapshot()
+                            .activation_services(&service)
+                            .unwrap_or_default()
+                    } else {
+                        self.engine
+                            .statuses()
+                            .filter(|(_, status)| status.desired == DesiredState::Inactive)
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    };
+                    let pending = if enabled {
+                        PendingRequest::start(request.request_id, request.operation, services)
+                    } else {
+                        PendingRequest::stop(request.request_id, request.operation, services)
+                    };
+                    self.set_pending(token, pending)?;
+                    return Ok(());
+                }
                 if enabled { "enabled" } else { "disabled" }
                     .as_bytes()
                     .to_vec()
@@ -545,12 +694,17 @@ impl Manager {
                 b"reloaded".to_vec()
             }
             Operation::Apply => {
-                self.reload_configuration(true)?;
-                let services = self
-                    .engine
-                    .snapshot()
-                    .activation_services(self.engine.snapshot().default_group())
+                let snapshot = self.load_snapshot()?;
+                let accounts = self.validate_accounts(&snapshot)?;
+                let services = snapshot
+                    .activation_services(snapshot.default_group())
                     .unwrap_or_default();
+                let effects = self
+                    .engine
+                    .apply_snapshot(Arc::new(snapshot), monotonic_ms()?)?;
+                self.accounts = accounts;
+                self.boot_checked = false;
+                self.apply_effects(effects)?;
                 self.set_pending(
                     token,
                     PendingRequest::apply(request.request_id, request.operation, services),
@@ -589,9 +743,11 @@ impl Manager {
                     PendingRequest::start(request.request_id, request.operation, services),
                 )?;
             }
-            Operation::Stop => {
+            Operation::Stop | Operation::StopForce => {
                 let target = payload_target(request)?;
-                let effects = self.engine.stop(&target)?;
+                let effects = self
+                    .engine
+                    .stop_with_force(&target, request.operation == Operation::StopForce)?;
                 self.apply_effects(effects)?;
                 let services = self
                     .engine
@@ -625,26 +781,16 @@ impl Manager {
             }
             Operation::ReloadService => {
                 let service = payload_target(request)?;
-                let success = match self.run_service_action(&service, ServiceAction::Reload) {
-                    Ok(success) => success,
-                    Err(error) => {
-                        eprintln!("loom: {service}: reload action failed: {error}");
-                        false
-                    }
-                };
-                self.respond(
+                let id = self.start_service_action(&service, ServiceAction::Reload)?;
+                self.set_pending(
                     token,
-                    request.request_id,
-                    request.operation,
-                    if success {
-                        StatusCode::Ok
-                    } else {
-                        StatusCode::ServiceFailure
+                    PendingRequest {
+                        request_id: request.request_id,
+                        operation: request.operation,
+                        deadline_ms: 0,
+                        kind: PendingKind::Action { id, result: None },
                     },
-                    if success { "reloaded" } else { "reload failed" }
-                        .as_bytes()
-                        .to_vec(),
-                );
+                )?;
             }
             _ => unreachable!("lifecycle dispatcher receives lifecycle operations"),
         }
@@ -692,20 +838,8 @@ impl Manager {
     }
 
     fn reload_configuration(&mut self, reconcile: bool) -> Result<(), ManagerError> {
-        let snapshot = match self.options.mode {
-            ManagerMode::System => ConfigLoader::load_system(&self.options.root)?,
-            ManagerMode::User => ConfigLoader::load_user(
-                &self.options.root,
-                self.options
-                    .config_home
-                    .as_deref()
-                    .ok_or(ManagerError::InvalidOptions(
-                        "user manager requires config_home",
-                    ))?,
-                &self.options.runtime_dir,
-                self.owner_identity.uid,
-            )?,
-        };
+        let snapshot = self.load_snapshot()?;
+        let accounts = self.validate_accounts(&snapshot)?;
         if reconcile {
             let effects = self
                 .engine
@@ -714,7 +848,35 @@ impl Manager {
         } else {
             self.engine.replace_snapshot(Arc::new(snapshot))?;
         }
+        self.accounts = accounts;
         Ok(())
+    }
+
+    fn load_snapshot(&self) -> Result<ConfigSnapshot, ManagerError> {
+        let snapshot = match self.options.mode {
+            ManagerMode::System => ConfigLoader::load_system(&self.options.root)?,
+            ManagerMode::User => ConfigLoader::load_user(
+                &self.options.root,
+                self.options
+                    .config_home
+                    .as_deref()
+                    .ok_or(ManagerError::InvalidOptions("missing config_home"))?,
+                &self.options.runtime_dir,
+                self.owner_identity.uid,
+            )?,
+        };
+        Ok(snapshot)
+    }
+
+    fn validate_accounts(
+        &self,
+        snapshot: &ConfigSnapshot,
+    ) -> Result<AccountDatabase, ManagerError> {
+        let accounts = AccountDatabase::load(&self.options.root)?;
+        for definition in snapshot.services().values() {
+            accounts.resolve(&definition.process, self.scope(), &self.owner_identity)?;
+        }
+        Ok(accounts)
     }
 
     fn load_with_manager(&self, source: &str) -> Result<ConfigSnapshot, ManagerError> {
@@ -778,6 +940,14 @@ impl Manager {
                 client.pending = None;
             }
             self.respond(token, request_id, operation, status, payload);
+            if status == StatusCode::Ok && operation == Operation::Apply {
+                if let Some(state) = &mut self.rescue {
+                    state.recovering = true;
+                }
+                if let Err(error) = self.poll_rescue() {
+                    eprintln!("loom: rescue cleanup failed: {error}");
+                }
+            }
         }
     }
 
@@ -788,7 +958,16 @@ impl Manager {
                     .iter()
                     .filter_map(|service| self.engine.status(service))
                     .collect::<Vec<_>>();
-                if matches!(pending.kind, PendingKind::Apply(_)) && self.engine.apply_pending() {
+                if matches!(pending.kind, PendingKind::Apply(_))
+                    && (self.engine.apply_pending()
+                        || self.engine.statuses().any(|(_, status)| {
+                            status.desired == DesiredState::Inactive
+                                && !matches!(
+                                    status.observed,
+                                    ObservedState::Inactive | ObservedState::Failed
+                                )
+                        }))
+                {
                     None
                 } else if statuses.iter().any(|status| {
                     status.observed == ObservedState::Failed && status.blocked_by.is_none()
@@ -803,6 +982,16 @@ impl Manager {
                     None
                 }
             }
+            PendingKind::Action { result, .. } => result.map(|status| {
+                (
+                    status,
+                    if status == StatusCode::Ok {
+                        b"completed".to_vec()
+                    } else {
+                        b"action failed".to_vec()
+                    },
+                )
+            }),
             PendingKind::Stop(services) => services
                 .iter()
                 .all(|service| {
@@ -836,29 +1025,37 @@ impl Manager {
         status: StatusCode,
         payload: Vec<u8>,
     ) {
-        let packet = Packet {
-            kind: MessageKind::Response,
-            request_id,
-            operation,
-            status,
-            more: false,
-            payload,
-        };
-        let result = packet.encode().map_err(protocol_io).and_then(|encoded| {
-            self.clients
-                .get(&token)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "client disconnected"))?
-                .connection
-                .send(&encoded)
-        });
-        if result.is_err() {
-            self.remove_client(token);
+        if self
+            .clients
+            .get(&token)
+            .is_some_and(|client| client.format_toml)
+        {
+            self.respond_report(
+                token,
+                request_id,
+                operation,
+                status,
+                Report {
+                    message: Some(String::from_utf8(payload).unwrap_or_else(|error| {
+                        String::from_utf8_lossy(error.as_bytes()).into_owned()
+                    })),
+                    ..Report::default()
+                },
+            );
+        } else {
+            self.queue_response(token, request_id, operation, status, &payload);
         }
     }
 
     fn status_payload(&self, target: &[u8]) -> Vec<u8> {
         let target = std::str::from_utf8(target).unwrap_or("").trim();
         let mut output = String::new();
+        if target.is_empty()
+            && let Some(state) = &self.rescue
+            && !state.recovering
+        {
+            writeln!(output, "mode=rescue\nreason={}", state.reason).expect("String write");
+        }
         for (service, status) in self.engine.statuses() {
             if !target.is_empty() && service.as_str() != target {
                 continue;
@@ -975,6 +1172,7 @@ impl Manager {
         if self.shutdown.is_some() {
             return Ok(());
         }
+        self.recover_rescue()?;
         let shutdown_group = self.engine.snapshot().shutdown_group().cloned();
         if let Some(group) = shutdown_group {
             let pending = self
@@ -1026,6 +1224,11 @@ impl Manager {
                 let effects = self.engine.stop_all();
                 self.apply_effects(effects)?;
                 if self.processes.is_empty()
+                    && self.actions.is_empty()
+                    && self
+                        .rescue
+                        .as_ref()
+                        .is_none_or(|state| state.process.is_none())
                     && self.engine.statuses().all(|(_, status)| {
                         matches!(
                             status.observed,
@@ -1040,6 +1243,11 @@ impl Manager {
             }
             ShutdownPhase::Stopping
                 if self.processes.is_empty()
+                    && self.actions.is_empty()
+                    && self
+                        .rescue
+                        .as_ref()
+                        .is_none_or(|state| state.process.is_none())
                     && self.engine.statuses().all(|(_, status)| {
                         matches!(
                             status.observed,
@@ -1069,29 +1277,25 @@ impl Manager {
                     generation,
                     force,
                 } => {
-                    if !force
-                        && self.engine.snapshot().services()[&service]
-                            .actions
-                            .stop
-                            .is_some()
-                    {
-                        match self.run_service_action(&service, ServiceAction::Stop) {
-                            Ok(true) => {}
-                            Ok(false) => eprintln!("loom: {service}: stop action failed"),
-                            Err(error) => {
-                                eprintln!("loom: {service}: stop action failed: {error}");
-                            }
+                    if force {
+                        self.cancel_actions(&service, generation)?;
+                    }
+                    let has_stop_action = self
+                        .engine
+                        .snapshot()
+                        .services()
+                        .get(&service)
+                        .is_some_and(|definition| definition.actions.stop.is_some());
+                    if !force && has_stop_action {
+                        match self.start_service_action(&service, ServiceAction::Stop) {
+                            Ok(_) => continue,
+                            Err(error) => eprintln!("loom: {service}: stop action failed: {error}"),
                         }
                     }
                     if let Some(slot) = self.processes.get(&service)
                         && slot.generation == generation
                     {
-                        if let Some(cgroup) = &slot.cgroup
-                            && let Err(error) = cgroup.terminate(force)
-                        {
-                            eprintln!("loom: {service}: cannot signal cgroup: {error}");
-                        }
-                        slot.process.terminate(force).map_err(process_io)?;
+                        slot.signal(force)?;
                     }
                 }
                 RuntimeEffect::ArmTimer {
@@ -1112,67 +1316,6 @@ impl Manager {
             }
         }
         Ok(())
-    }
-
-    fn run_service_action(
-        &mut self,
-        service: &ServiceId,
-        action: ServiceAction,
-    ) -> Result<bool, ManagerError> {
-        let definition = self
-            .engine
-            .snapshot()
-            .services()
-            .get(service)
-            .ok_or_else(|| RuntimeError::UnknownTarget(service.clone()))?;
-        let command = match action {
-            ServiceAction::Stop => definition.actions.stop.clone(),
-            ServiceAction::Reload => definition.actions.reload.clone(),
-        }
-        .ok_or_else(|| {
-            ManagerError::InvalidTarget(format!("{service} has no {} action", action.name()))
-        })?;
-        let main_pid = self
-            .processes
-            .get(service)
-            .map(|slot| slot.process.pid())
-            .ok_or_else(|| ManagerError::InvalidTarget(format!("{service} is not running")))?;
-        let account = self.accounts.resolve(
-            &definition.process,
-            match self.options.mode {
-                ManagerMode::System => ManagerScope::System,
-                ManagerMode::User => ManagerScope::User,
-            },
-            &self.owner_identity,
-        )?;
-        let mut environment = self.base_environment.clone();
-        environment.insert("HOME".into(), account.home);
-        environment.insert("USER".into(), account.name.clone());
-        environment.insert("LOGNAME".into(), account.name);
-        environment.insert("SHELL".into(), account.shell);
-        environment.insert("LOOM_MAINPID".into(), main_pid.to_string());
-        let identity = (self.options.mode == ManagerMode::System).then_some(&account.identity);
-        let mut action_definition = definition.clone();
-        action_definition.process.command = command;
-        action_definition.process.readiness = Readiness::Exec;
-        let timeout_ms = match action {
-            ServiceAction::Stop => definition.supervision.stop_timeout_ms,
-            ServiceAction::Reload => definition.supervision.start_timeout_ms,
-        };
-        let mut process = SpawnedProcess::spawn(&action_definition, identity, &environment, None)
-            .map_err(process_io)?;
-        let deadline = monotonic_ms()?.saturating_add(timeout_ms);
-        loop {
-            if let Some(status) = process.try_wait().map_err(process_io)? {
-                return Ok(status.success());
-            }
-            if monotonic_ms()? >= deadline {
-                process.terminate(true).map_err(process_io)?;
-                let _ = process.wait().map_err(process_io)?;
-                return Ok(false);
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
     fn spawn(&mut self, service: &ServiceId, generation: u64) -> RuntimeEvent {
@@ -1286,6 +1429,31 @@ impl Manager {
         } else {
             None
         };
+        let domain_token = match self.register_domain(
+            cgroup.as_ref(),
+            Source::Process {
+                service: service.clone(),
+                generation,
+            },
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                let _ = self.reactor.remove(process.pidfd().as_raw_fd());
+                self.sources.remove(&pid_token);
+                if let Some(token) = notify_token {
+                    self.sources.remove(&token);
+                    if let Some(fd) = process.notification_fd() {
+                        let _ = self.reactor.remove(fd.as_raw_fd());
+                    }
+                }
+                if let Some(domain) = &cgroup {
+                    let _ = domain.terminate(true);
+                }
+                let _ = process.terminate(true);
+                let _ = process.wait();
+                return Err(error);
+            }
+        };
         self.processes.insert(
             service,
             ProcessSlot {
@@ -1293,7 +1461,9 @@ impl Manager {
                 generation,
                 pid_token,
                 notify_token,
+                domain_token,
                 cgroup,
+                exit_status: None,
             },
         );
         Ok(())
@@ -1359,52 +1529,64 @@ impl Manager {
         service: &ServiceId,
         generation: u64,
     ) -> Result<(), ManagerError> {
-        let status = self
+        let Some(slot) = self
             .processes
             .get_mut(service)
             .filter(|slot| slot.generation == generation)
-            .map(|slot| slot.process.try_wait())
-            .transpose()
-            .map_err(process_io)?
-            .flatten();
-        if let Some(status) = status {
-            self.finish_process(service, generation, status)?;
+        else {
+            return Ok(());
+        };
+        if !slot.poll_exit(&self.reactor)? {
+            return Ok(());
         }
-        Ok(())
+        if self
+            .actions
+            .values()
+            .any(|action| action.service == *service && action.generation == generation)
+        {
+            self.cancel_actions(service, generation)?;
+            return Ok(());
+        }
+        self.finish_process(service, generation)
     }
 
     fn collect_process_exits(&mut self) -> Result<(), ManagerError> {
-        let services = self.processes.keys().cloned().collect::<Vec<_>>();
-        for service in services {
-            let generation = self.processes[&service].generation;
+        // Never use waitpid(-1): a tracked child can exit between two probes.
+        let tracked = self
+            .processes
+            .values()
+            .map(|slot| slot.process.pid())
+            .chain(self.actions.values().map(|slot| slot.process.process.pid()))
+            .chain(
+                self.rescue
+                    .iter()
+                    .filter_map(|state| state.process.as_ref().map(|slot| slot.process.pid())),
+            )
+            .collect();
+        reap_untracked_children(&tracked)?;
+        self.poll_rescue()?;
+        for id in self.actions.keys().copied().collect::<Vec<_>>() {
+            self.handle_action_exit(id)?;
+        }
+        for (service, generation) in self
+            .processes
+            .iter()
+            .map(|(id, slot)| (id.clone(), slot.generation))
+            .collect::<Vec<_>>()
+        {
             self.handle_process_exit(&service, generation)?;
         }
-        while reap_exited_child()?.is_some() {}
         Ok(())
     }
 
-    fn finish_process(
-        &mut self,
-        service: &ServiceId,
-        generation: u64,
-        status: std::process::ExitStatus,
-    ) -> Result<(), ManagerError> {
-        let Some(mut slot) = self.processes.remove(service) else {
+    fn finish_process(&mut self, service: &ServiceId, generation: u64) -> Result<(), ManagerError> {
+        let Some(slot) = self.processes.remove(service) else {
             return Ok(());
         };
-        self.reactor.remove(slot.process.pidfd().as_raw_fd())?;
-        self.sources.remove(&slot.pid_token);
-        if let Some(token) = slot.notify_token {
-            self.sources.remove(&token);
-            if let Some(descriptor) = slot.process.take_notification() {
-                self.reactor.remove(descriptor.as_raw_fd())?;
-            }
-        }
-        if let Some(cgroup) = &slot.cgroup
-            && let Err(error) = cgroup.terminate(true)
-        {
-            eprintln!("loom: {service}: cannot clean cgroup: {error}");
-        }
+        slot.unregister(&self.reactor, &mut self.sources);
+        let status = slot
+            .exit_status
+            .expect("process domain is drained only after exit");
         let outcome = if status.success() {
             ExitOutcome::Success
         } else if let Some(signal) = status.signal() {
@@ -1450,6 +1632,13 @@ impl Manager {
         {
             let deadline = self.deadlines.pop().expect("peeked deadline exists");
             match deadline.action {
+                DeadlineAction::Rescue => self.start_rescue()?,
+                DeadlineAction::Action(id) => {
+                    if let Some(action) = self.actions.get_mut(&id) {
+                        action.timed_out = true;
+                        action.process.signal(true)?;
+                    }
+                }
                 DeadlineAction::Runtime {
                     service,
                     generation,
@@ -1504,6 +1693,8 @@ enum Source {
     Signal,
     Timer,
     Client(u64),
+    Action(u64),
+    Rescue,
     Process {
         service: ServiceId,
         generation: u64,
@@ -1519,6 +1710,8 @@ struct Client {
     connection: SeqPacketConnection,
     credentials_uid: u32,
     pending: Option<PendingRequest>,
+    format_toml: bool,
+    outgoing: VecDeque<Vec<u8>>,
 }
 
 struct ProcessSlot {
@@ -1527,6 +1720,8 @@ struct ProcessSlot {
     pid_token: u64,
     notify_token: Option<u64>,
     cgroup: Option<CgroupDomain>,
+    domain_token: Option<u64>,
+    exit_status: Option<std::process::ExitStatus>,
 }
 
 struct PendingRequest {
@@ -1583,6 +1778,10 @@ impl PendingRequest {
 }
 
 enum PendingKind {
+    Action {
+        id: u64,
+        result: Option<StatusCode>,
+    },
     Start(BTreeSet<ServiceId>),
     Apply(BTreeSet<ServiceId>),
     Stop(BTreeSet<ServiceId>),
@@ -1616,6 +1815,8 @@ impl PartialOrd for Deadline {
 
 #[derive(Eq, PartialEq)]
 enum DeadlineAction {
+    Action(u64),
+    Rescue,
     Runtime {
         service: ServiceId,
         generation: u64,
@@ -1701,6 +1902,7 @@ const fn is_mutating(operation: Operation) -> bool {
             | Operation::Dependencies
             | Operation::Timings
             | Operation::CriticalPath
+            | Operation::ApplyDryRun
     )
 }
 
@@ -1719,6 +1921,40 @@ const fn desired_name(state: DesiredState) -> &'static str {
         DesiredState::Inactive => "inactive",
         DesiredState::Active => "active",
     }
+}
+
+fn initial_snapshot(
+    options: &ManagerOptions,
+    owner_identity: &ResolvedIdentity,
+) -> Result<(ConfigSnapshot, Option<String>), ManagerError> {
+    let snapshot = match options.mode {
+        ManagerMode::System => ConfigLoader::load_system(&options.root),
+        ManagerMode::User => ConfigLoader::load_user(
+            &options.root,
+            options
+                .config_home
+                .as_deref()
+                .ok_or(ManagerError::InvalidOptions(
+                    "user manager requires config_home",
+                ))?,
+            &options.runtime_dir,
+            owner_identity.uid,
+        ),
+    };
+    let (snapshot, initial_failure) = match snapshot {
+        Ok(snapshot) => (snapshot, None),
+        Err(error) if options.mode == ManagerMode::System => (
+            ConfigSnapshot::build(
+                "schema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\n",
+                std::iter::empty(),
+                ManagerScope::System,
+            )
+            .map_err(LoadError::from)?,
+            Some(error.to_string()),
+        ),
+        Err(error) => return Err(error.into()),
+    };
+    Ok((snapshot, initial_failure))
 }
 
 fn control_directory(options: &ManagerOptions) -> PathBuf {
@@ -1743,10 +1979,6 @@ fn create_control_directory(path: &Path, mode: ManagerMode, uid: u32) -> io::Res
         ));
     }
     Ok(())
-}
-
-fn protocol_io(error: ProtocolError) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn process_io(error: ProcessError) -> ManagerError {

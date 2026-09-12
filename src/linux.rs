@@ -2,13 +2,17 @@
 #![allow(unsafe_code)]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsString},
     fs::{File, OpenOptions},
     io,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
-        unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
+        unix::{
+            fs::{FileExt, OpenOptionsExt},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
@@ -82,6 +86,44 @@ pub fn reap_exited_child() -> io::Result<Option<i32>> {
             }
         }
     }
+}
+
+/// Makes this manager adopt descendants left behind by service leaders.
+///
+/// # Errors
+/// Returns the error from `prctl`.
+pub fn become_subreaper() -> io::Result<()> {
+    // SAFETY: prctl receives a documented operation and scalar arguments.
+    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Reaps adopted children without consuming the exit status of a tracked child.
+///
+/// # Errors
+/// Returns an unexpected procfs or waitpid error.
+pub fn reap_untracked_children(tracked: &BTreeSet<u32>) -> io::Result<()> {
+    let children =
+        std::fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))?;
+    for child in children.split_whitespace() {
+        let pid: u32 = child
+            .parse()
+            .map_err(|_| io::Error::other("invalid child PID"))?;
+        if tracked.contains(&pid) {
+            continue;
+        }
+        let pid = i32::try_from(pid).map_err(|_| io::Error::other("invalid child PID"))?;
+        // SAFETY: waitpid has no output pointer and never blocks.
+        if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == -1 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ECHILD | libc::EINTR)) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Flushes filesystem buffers and requests a Linux reboot or poweroff.
@@ -239,6 +281,7 @@ fn clear_signal_mask() -> io::Result<()> {
 pub struct CgroupDomain {
     path: PathBuf,
     procs: File,
+    events: File,
 }
 
 impl CgroupDomain {
@@ -250,16 +293,51 @@ impl CgroupDomain {
     pub fn create(root: &Path, service: &str, generation: u64) -> io::Result<Self> {
         let path = root.join(format!("{service}-{generation}"));
         std::fs::create_dir(&path)?;
-        let procs = OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(path.join("cgroup.procs"))?;
-        Ok(Self { path, procs })
+        let result = (|| -> io::Result<Self> {
+            let procs = OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path.join("cgroup.procs"))?;
+            let events = File::open(path.join("cgroup.events"))?;
+            Ok(Self {
+                path: path.clone(),
+                procs,
+                events,
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir(&path);
+        }
+        result
     }
 
     #[must_use]
     fn procs_fd(&self) -> &File {
         &self.procs
+    }
+
+    #[must_use]
+    pub const fn events(&self) -> &File {
+        &self.events
+    }
+
+    /// Checks the kernel's recursive populated state, acknowledging notifications.
+    ///
+    /// # Errors
+    /// Returns an IO error or rejects a missing populated record.
+    pub fn is_empty(&self) -> io::Result<bool> {
+        let mut buffer = [0_u8; 4096];
+        let length = self.events.read_at(&mut buffer, 0)?;
+        let events = std::str::from_utf8(&buffer[..length])
+            .map_err(|_| io::Error::other("invalid cgroup.events"))?;
+        match events
+            .lines()
+            .find_map(|line| line.strip_prefix("populated "))
+        {
+            Some("0") => Ok(true),
+            Some("1") => Ok(false),
+            _ => Err(io::Error::other("missing cgroup populated state")),
+        }
     }
 
     /// Signals every task in the process domain.
@@ -273,15 +351,19 @@ impl CgroupDomain {
             return std::fs::write(kill_path, b"1");
         }
         let signal = if force { libc::SIGKILL } else { libc::SIGTERM };
-        for line in std::fs::read_to_string(self.path.join("cgroup.procs"))?.lines() {
-            let pid = line
-                .parse::<i32>()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup PID"))?;
-            // SAFETY: PID came from cgroup.procs and signal is a valid constant.
-            if unsafe { libc::kill(pid, signal) } == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
+        let mut paths = vec![self.path.clone()];
+        while let Some(path) = paths.pop() {
+            paths.extend(cgroup_children(&path)?);
+            for line in std::fs::read_to_string(path.join("cgroup.procs"))?.lines() {
+                let pid = line.parse::<i32>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid cgroup PID")
+                })?;
+                // SAFETY: PID came from cgroup.procs and signal is a valid constant.
+                if unsafe { libc::kill(pid, signal) } == -1 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -291,8 +373,28 @@ impl CgroupDomain {
 
 impl Drop for CgroupDomain {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
+        let _ = remove_empty_cgroups(&self.path);
     }
+}
+
+fn cgroup_children(path: &Path) -> io::Result<Vec<PathBuf>> {
+    std::fs::read_dir(path)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => match entry.file_type() {
+                Ok(kind) if kind.is_dir() => Some(Ok(entry.path())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            },
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+fn remove_empty_cgroups(path: &Path) -> io::Result<()> {
+    for child in cgroup_children(path)? {
+        remove_empty_cgroups(&child)?;
+    }
+    std::fs::remove_dir(path)
 }
 
 /// Creates the manager's cgroup v2 subtree. A user manager succeeds only when
@@ -330,7 +432,7 @@ pub fn prepare_cgroup_root(system: bool, uid: u32) -> io::Result<PathBuf> {
         let path = entry?.path();
         if path.is_dir() {
             let _ = std::fs::write(path.join("cgroup.kill"), b"1");
-            let _ = std::fs::remove_dir(path);
+            let _ = remove_empty_cgroups(&path);
         }
     }
     Ok(root)
@@ -362,31 +464,124 @@ impl StartupLock {
     }
 }
 
-/// Starts a manager in a new session. The returned child is used only to detect
-/// immediate startup failure; dropping it does not terminate the manager.
+pub struct UserManagerChild {
+    child: Child,
+    readiness: OwnedFd,
+}
+
+impl UserManagerChild {
+    /// Waits for the manager's explicit readiness message and kills failed startups.
+    ///
+    /// # Errors
+    /// Returns timeout, early exit, or malformed readiness errors.
+    pub fn wait_ready(mut self, timeout: Duration) -> io::Result<()> {
+        let mut poll = libc::pollfd {
+            fd: self.readiness.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = std::time::Instant::now() + timeout;
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "user manager startup timed out",
+                ));
+            }
+            let milliseconds = i32::try_from(remaining.as_millis())
+                .unwrap_or(i32::MAX)
+                .max(1);
+            // SAFETY: poll points to one initialized entry and timeout is bounded.
+            let ready = unsafe { libc::poll(std::ptr::addr_of_mut!(poll), 1, milliseconds) };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break Err(error);
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = 0_u8;
+            // SAFETY: readiness is an owned pipe and byte has one writable byte.
+            let count = unsafe {
+                libc::read(
+                    self.readiness.as_raw_fd(),
+                    std::ptr::addr_of_mut!(byte).cast(),
+                    1,
+                )
+            };
+            break if count == 1 && byte == b'R' {
+                Ok(())
+            } else {
+                Err(io::Error::other("user manager exited before readiness"))
+            };
+        };
+        if result.is_err() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        result
+    }
+}
+
+/// Starts a manager in a new session with a one-shot readiness pipe.
 ///
 /// # Errors
-///
-/// Returns an error from process creation or the pre-exec `setsid` call.
-pub fn spawn_user_manager(program: &Path, arguments: &[OsString]) -> io::Result<Child> {
+/// Returns pipe creation, process creation, or child setup errors.
+pub fn spawn_user_manager(program: &Path, arguments: &[OsString]) -> io::Result<UserManagerChild> {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors has room for both newly allocated descriptors.
+    if unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful pipe2 returned distinct new descriptors, each transferred once.
+    let readiness = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: the second pipe end is independently owned.
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    let fd = writer.as_raw_fd();
     let mut command = Command::new(program);
     command
         .args(arguments)
+        .arg("--ready-fd")
+        .arg(fd.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
-    // SAFETY: setsid is async-signal-safe, takes no pointers, and failures are
-    // reported through Command's exec-error pipe.
+    // SAFETY: setup uses async-signal-safe calls and only scalar captured values.
     unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
+        command.pre_exec(move || {
+            clear_signal_mask()?;
+            if libc::setsid() == -1 || libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(io::Error::last_os_error());
             }
+            Ok(())
         });
     }
-    command.spawn()
+    let child = command.spawn()?;
+    drop(writer);
+    Ok(UserManagerChild { child, readiness })
+}
+
+/// Acknowledges completed manager initialization to the launcher.
+///
+/// # Errors
+/// Returns an invalid descriptor or pipe write error.
+pub fn notify_launcher(fd: i32) -> io::Result<()> {
+    if fd < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid readiness descriptor",
+        ));
+    }
+    // SAFETY: write reads one initialized byte; the caller designated this FD.
+    let written = unsafe { libc::write(fd, b"R".as_ptr().cast(), 1) };
+    let error = io::Error::last_os_error();
+    // SAFETY: this inherited descriptor is consumed once by the readiness handshake.
+    unsafe { libc::close(fd) };
+    if written == 1 { Ok(()) } else { Err(error) }
 }
 
 #[derive(Debug, Error)]
@@ -528,6 +723,69 @@ impl SpawnedProcess {
         })
     }
 
+    /// Starts an interactive rescue command in its own session on the console.
+    ///
+    /// # Errors
+    /// Returns an error opening the console, creating the child or its pidfd.
+    pub fn spawn_rescue(
+        arguments: &[String],
+        cgroup: Option<&CgroupDomain>,
+    ) -> Result<Self, ProcessError> {
+        let mut command = Command::new(&arguments[0]);
+        command
+            .args(&arguments[1..])
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("HOME", "/root")
+            .env("TERM", "linux");
+        let console = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/console")
+            .map_err(|source| ProcessError::PrepareIo {
+                stream: "console",
+                source,
+            })?;
+        command
+            .stdin(console.try_clone().map_err(ProcessError::Spawn)?)
+            .stdout(console.try_clone().map_err(ProcessError::Spawn)?)
+            .stderr(console);
+        let cgroup_fd = cgroup.map(|domain| domain.procs_fd().as_raw_fd());
+        // SAFETY: all captured state is scalar; child setup uses only libc syscalls.
+        unsafe {
+            command.pre_exec(move || {
+                clear_signal_mask()?;
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::isatty(0) == 1 && libc::ioctl(0, libc::TIOCSCTTY, 1) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if let Some(fd) = cgroup_fd
+                    && libc::write(fd, b"0".as_ptr().cast(), 1) != 1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+        let pid = child.id();
+        let pidfd = match open_pidfd(pid) {
+            Ok(fd) => fd,
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProcessError::Pidfd { pid, source });
+            }
+        };
+        Ok(Self {
+            child,
+            pidfd,
+            notification: None,
+        })
+    }
+
     #[must_use]
     pub fn pid(&self) -> u32 {
         self.child.id()
@@ -605,6 +863,24 @@ impl SpawnedProcess {
                 pid: self.pid(),
                 source,
             })
+        }
+    }
+
+    /// Checks whether the fallback process group still contains processes.
+    ///
+    /// # Errors
+    /// Returns an unexpected kill error.
+    pub fn group_is_empty(&self) -> io::Result<bool> {
+        let pid = i32::try_from(self.pid()).map_err(|_| io::Error::other("invalid PID"))?;
+        // SAFETY: signal zero only probes existence of the service process group.
+        if unsafe { libc::kill(-pid, 0) } == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(true),
+            Some(libc::EPERM) => Ok(false),
+            _ => Err(error),
         }
     }
 
@@ -729,11 +1005,41 @@ mod tests {
 
     #[test]
     fn passes_nonblocking_notify_socket() {
-        let service = definition(
-            &["/bin/sh", "-c", "eval 'printf READY >&'$LOOM_NOTIFY_FD"],
+        // Other tests can release low-numbered descriptors after we reserve
+        // ours. Run this descriptor-sensitive check in a fresh test process.
+        if std::env::var_os("LOOM_TEST_NOTIFY_ISOLATED").is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::tests::passes_nonblocking_notify_socket",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("LOOM_TEST_NOTIFY_ISOLATED", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated notify test failed");
+            return;
+        }
+        // Keep the notification descriptor above 9: POSIX shell redirections
+        // are not a portable way to write to arbitrary inherited descriptors.
+        let _held = (0..16)
+            .map(|_| File::open("/dev/null").unwrap())
+            .collect::<Vec<_>>();
+        let executable = std::env::current_exe().unwrap();
+        let mut service = definition(
+            &[
+                executable.to_str().unwrap(),
+                "--exact",
+                "linux::tests::notify_child_helper",
+                "--test-threads=1",
+                "--nocapture",
+            ],
             "notify",
         );
-        let mut process = SpawnedProcess::spawn(&service, None, &BTreeMap::new(), None).unwrap();
+        service.io.stderr = OutputTarget::Console;
+        let environment = BTreeMap::from([("LOOM_TEST_NOTIFY_CHILD".into(), "1".into())]);
+        let mut process = SpawnedProcess::spawn(&service, None, &environment, None).unwrap();
 
         let mut notification = NotificationRead::Pending;
         for _ in 0..100 {
@@ -743,8 +1049,19 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        let _ = process.wait().unwrap();
+        assert!(process.wait().unwrap().success(), "notify helper failed");
         assert_eq!(notification, NotificationRead::Message(b"READY".to_vec()));
+    }
+
+    #[test]
+    fn notify_child_helper() {
+        if std::env::var_os("LOOM_TEST_NOTIFY_CHILD").is_none() {
+            return;
+        }
+        let fd: i32 = std::env::var("LOOM_NOTIFY_FD").unwrap().parse().unwrap();
+        assert!(fd > 9);
+        // SAFETY: the parent passed a notification socket and READY has five bytes.
+        assert_eq!(unsafe { libc::write(fd, b"READY".as_ptr().cast(), 5) }, 5);
     }
 
     #[test]

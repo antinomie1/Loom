@@ -49,6 +49,8 @@ pub enum Operation {
     CriticalPath = 16,
     Reboot = 17,
     Poweroff = 18,
+    ApplyDryRun = 19,
+    StopForce = 20,
 }
 
 impl TryFrom<u16> for Operation {
@@ -74,6 +76,8 @@ impl TryFrom<u16> for Operation {
             16 => Ok(Self::CriticalPath),
             17 => Ok(Self::Reboot),
             18 => Ok(Self::Poweroff),
+            19 => Ok(Self::ApplyDryRun),
+            20 => Ok(Self::StopForce),
             _ => Err(ProtocolError::InvalidOperation(value)),
         }
     }

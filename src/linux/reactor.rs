@@ -75,6 +75,30 @@ impl Reactor {
         self.control(libc::EPOLL_CTL_ADD, fd.as_raw_fd(), token, writable)
     }
 
+    /// Watches cgroup.events state changes without polling.
+    ///
+    /// # Errors
+    /// Returns the error from `epoll_ctl`.
+    pub fn add_priority(&self, fd: BorrowedFd<'_>, token: u64) -> io::Result<()> {
+        let mut event = libc::epoll_event {
+            events: (libc::EPOLLPRI | libc::EPOLLERR) as u32,
+            u64: token,
+        };
+        // SAFETY: the descriptors are owned and event is initialized.
+        if unsafe {
+            libc::epoll_ctl(
+                self.epoll.as_raw_fd(),
+                libc::EPOLL_CTL_ADD,
+                fd.as_raw_fd(),
+                std::ptr::addr_of_mut!(event),
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Changes writable interest without changing the token.
     ///
     /// # Errors

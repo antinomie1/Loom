@@ -3,11 +3,11 @@
 use std::{
     env,
     ffi::OsString,
-    io,
+    io::{self, Write as _},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::ExitCode,
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use lexopt::prelude::*;
@@ -22,7 +22,14 @@ fn main() -> ExitCode {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("loomctl: {error}");
-            ExitCode::from(2)
+            ExitCode::from(error.downcast_ref::<io::Error>().map_or(
+                2,
+                |error| match error.kind() {
+                    io::ErrorKind::PermissionDenied => 3,
+                    io::ErrorKind::TimedOut => 5,
+                    _ => 4,
+                },
+            ))
         }
     }
 }
@@ -35,6 +42,9 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     let mut command = None;
     let mut target = None;
     let mut now = false;
+    let mut dry_run = false;
+    let mut force = false;
+    let mut format_toml = false;
     while let Some(argument) = parser.next()? {
         match argument {
             Long("user") => user = true,
@@ -42,6 +52,13 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             Long("root") => root = parser.value()?.into(),
             Long("runtime-dir") => runtime_dir = Some(PathBuf::from(parser.value()?)),
             Long("now") => now = true,
+            Long("dry-run") => dry_run = true,
+            Long("force") => force = true,
+            Long("format") => match parser.value()?.to_str() {
+                Some("toml") => format_toml = true,
+                Some("human") => format_toml = false,
+                _ => return Err("--format must be human or toml".into()),
+            },
             Long("help") | Short('h') => {
                 print_help();
                 return Ok(0);
@@ -57,29 +74,20 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
     }
 
     let command = command.ok_or("missing command")?;
-    let operation = parse_operation(&command)?;
-    let needs_target = matches!(
-        operation,
-        Operation::Start
-            | Operation::Stop
-            | Operation::Restart
-            | Operation::ReloadService
-            | Operation::IsActive
-            | Operation::IsEnabled
-            | Operation::Dependencies
-            | Operation::Enable
-            | Operation::Disable
-            | Operation::ResetFailed
-    );
-    if needs_target && target.is_none() {
-        return Err(format!("{} requires a service name", command.to_string_lossy()).into());
+    let mut operation = parse_operation(&command)?;
+    if dry_run {
+        if operation != Operation::Apply {
+            return Err("--dry-run is valid only with apply".into());
+        }
+        operation = Operation::ApplyDryRun;
     }
-    if !needs_target && target.is_some() && operation != Operation::Status {
-        return Err("unexpected service name".into());
+    if force {
+        if operation != Operation::Stop {
+            return Err("--force is valid only with stop".into());
+        }
+        operation = Operation::StopForce;
     }
-    if now && !matches!(operation, Operation::Enable | Operation::Disable) {
-        return Err("--now is valid only with enable or disable".into());
-    }
+    validate_target(operation, target.as_ref(), now)?;
 
     let runtime_dir = if user {
         runtime_dir
@@ -89,8 +97,13 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
         runtime_dir.unwrap_or_else(|| root.join("run"))
     };
     let socket = runtime_dir.join("loom/control.sock");
-    let connection = connect(&socket, user, &root, &runtime_dir)?;
-    let request = Packet {
+    let connection = connect(
+        &socket,
+        user && operation != Operation::ApplyDryRun,
+        &root,
+        &runtime_dir,
+    )?;
+    let mut request = Packet {
         kind: MessageKind::Request,
         request_id: 1,
         operation,
@@ -107,6 +120,49 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             })
             .unwrap_or_default(),
     };
+    if format_toml {
+        request.payload.splice(..0, b"toml\n".iter().copied());
+    }
+    exchange(&connection, &request, format_toml)
+}
+
+fn validate_target(
+    operation: Operation,
+    target: Option<&OsString>,
+    now: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let needs_target = matches!(
+        operation,
+        Operation::Start
+            | Operation::Stop
+            | Operation::StopForce
+            | Operation::Restart
+            | Operation::ReloadService
+            | Operation::IsActive
+            | Operation::IsEnabled
+            | Operation::Dependencies
+            | Operation::Enable
+            | Operation::Disable
+            | Operation::ResetFailed
+    );
+    if needs_target && target.is_none() {
+        return Err(format!("{operation:?} requires a service name").into());
+    }
+    if !needs_target && target.is_some() && operation != Operation::Status {
+        return Err("unexpected service name".into());
+    }
+    if now && !matches!(operation, Operation::Enable | Operation::Disable) {
+        return Err("--now is valid only with enable or disable".into());
+    }
+
+    Ok(())
+}
+
+fn exchange(
+    connection: &SeqPacketConnection,
+    request: &Packet,
+    format_toml: bool,
+) -> Result<u8, Box<dyn std::error::Error>> {
     connection.send(&request.encode()?)?;
 
     loop {
@@ -116,9 +172,15 @@ fn run() -> Result<u8, Box<dyn std::error::Error>> {
             return Err("manager returned an unrelated response".into());
         }
         if !response.payload.is_empty() {
-            print!("{}", String::from_utf8_lossy(&response.payload));
-            if !response.payload.ends_with(b"\n") {
-                println!();
+            let mut output: Box<dyn io::Write> =
+                if !format_toml && response.status != StatusCode::Ok {
+                    Box::new(io::stderr())
+                } else {
+                    Box::new(io::stdout())
+                };
+            output.write_all(&response.payload)?;
+            if !response.more && !response.payload.ends_with(b"\n") {
+                output.write_all(b"\n")?;
             }
         }
         if !response.more {
@@ -139,15 +201,20 @@ fn connect(
         Err(error) => return Err(error),
     }
 
+    let metadata = std::fs::symlink_metadata(runtime_dir)?;
+    let uid = loom::linux::current_identity()?.uid;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe XDG_RUNTIME_DIR",
+        ));
+    }
     let _lock = StartupLock::acquire(&runtime_dir.join("loom-start.lock"))?;
     if let Ok(connection) = SeqPacketConnection::connect(socket) {
         return Ok(connection);
     }
     let executable = env::current_exe()?;
-    let loom = executable
-        .parent()
-        .ok_or_else(|| io::Error::other("loomctl has no parent directory"))?
-        .join("loom");
+    let loom = manager_executable(&executable)?;
     let arguments = vec![
         OsString::from("--user"),
         OsString::from("--root"),
@@ -155,22 +222,27 @@ fn connect(
         OsString::from("--runtime-dir"),
         runtime_dir.as_os_str().to_owned(),
     ];
-    let mut child = spawn_user_manager(&loom, &arguments)?;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if let Ok(connection) = SeqPacketConnection::connect(socket) {
-            return Ok(connection);
+    spawn_user_manager(&loom, &arguments)?.wait_ready(Duration::from_secs(2))?;
+    SeqPacketConnection::connect(socket)
+}
+
+fn manager_executable(client: &Path) -> io::Result<PathBuf> {
+    let directory = client
+        .parent()
+        .ok_or_else(|| io::Error::other("loomctl has no parent"))?;
+    if let Some(prefix) = directory.parent() {
+        let installed = prefix.join("lib/loom/loom");
+        if installed.is_file() {
+            return Ok(installed);
         }
-        if let Some(status) = child.try_wait()? {
-            return Err(io::Error::other(format!(
-                "user manager exited during startup: {status}"
-            )));
-        }
-        thread::sleep(Duration::from_millis(10));
+    }
+    let sibling = directory.join("loom");
+    if sibling.is_file() {
+        return Ok(sibling);
     }
     Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        "user manager did not create its control socket",
+        io::ErrorKind::NotFound,
+        "Loom manager executable is not installed",
     ))
 }
 
@@ -222,6 +294,7 @@ fn print_help() {
          Usage: loomctl [--system|--user] COMMAND [SERVICE]\n\n\
          Commands: start stop restart reload-service status list is-active\n  \
                    is-enabled dependencies enable disable reload apply\n  \
-                   reset-failed timings critical-path reboot poweroff"
+                   reset-failed timings critical-path reboot poweroff\n\n\
+         Options: --now (enable/disable), --dry-run (apply), --force (stop), --format human|toml"
     );
 }
