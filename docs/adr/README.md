@@ -1,6 +1,6 @@
 # Architecture decision records
 
-All records are accepted on 2026-08-24.
+Each record carries its acceptance date.
 
 | ADR | Decision |
 |---|---|
@@ -12,3 +12,4 @@ All records are accepted on 2026-08-24.
 | [0006](0006-sage-integration.md) | Sage, channels, Recipes, and init switching |
 | [0007](0007-performance-contract.md) | Performance and release contract |
 | [0008](0008-module-and-portability-seams.md) | Module and portability seams |
+| [0009](0009-recovery-and-command-completion.md) | Recovery and command completion |
