@@ -9,15 +9,36 @@ permissions:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.96.1
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo check --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
-      - run: sudo apt-get update && sudo apt-get install -y cpio
+      - run: cargo check --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - name: Install minimal PID-1 test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cpio qemu-system-x86
+      - name: Fetch pinned correctness-test kernel
+        run: |
+          curl --fail --location --retry 3 \
+            https://snapshot.ubuntu.com/ubuntu/20260828T000000Z/pool/main/l/linux-signed/linux-image-6.8.0-138-generic_6.8.0-138.138_amd64.deb \
+            --output "$RUNNER_TEMP/loom-kernel.deb"
+          echo "7093879c9dad61fb24bb5a0247d8dd1ea444c4854492a9b3669175624cd04bda  $RUNNER_TEMP/loom-kernel.deb" | sha256sum --check
+          dpkg-deb --extract "$RUNNER_TEMP/loom-kernel.deb" target/qemu/kernel
       - run: tests/qemu/build-initramfs.sh
+      - name: Boot, recover, and shut down as PID 1
+        run: tests/qemu/regression.sh target/qemu/kernel/boot/vmlinuz-6.8.0-138-generic
+      - name: Retain guest correctness logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pid1-regression-logs
+          path: target/qemu/regression/*.log
+          if-no-files-found: ignore

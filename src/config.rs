@@ -28,6 +28,7 @@ pub struct ConfigSnapshot {
     default_group: ServiceId,
     shutdown_group: Option<ServiceId>,
     max_starting: usize,
+    rescue_command: Vec<String>,
     warnings: Vec<ConfigWarning>,
 }
 
@@ -57,6 +58,18 @@ impl ConfigSnapshot {
             });
         }
 
+        if raw.rescue_command.is_empty()
+            || !std::path::Path::new(&raw.rescue_command[0]).is_absolute()
+            || raw
+                .rescue_command
+                .iter()
+                .any(|argument| argument.contains('\0'))
+        {
+            return Err(ConfigError::InvalidField {
+                field: "rescue_command",
+                reason: "must be an argv array with an absolute executable and no NUL".into(),
+            });
+        }
         let default_group = ServiceId::new(raw.default_group)?;
         let mut groups = BTreeMap::new();
         for (name, group) in raw.groups {
@@ -101,6 +114,7 @@ impl ConfigSnapshot {
             default_group,
             shutdown_group,
             max_starting: raw.max_starting,
+            rescue_command: raw.rescue_command,
             warnings,
         })
     }
@@ -128,6 +142,11 @@ impl ConfigSnapshot {
     #[must_use]
     pub const fn max_starting(&self) -> usize {
         self.max_starting
+    }
+
+    #[must_use]
+    pub fn rescue_command(&self) -> &[String] {
+        &self.rescue_command
     }
 
     #[must_use]
@@ -194,6 +213,8 @@ struct RawManagerConfig {
     shutdown_group: Option<String>,
     #[serde(default = "default_max_starting")]
     max_starting: usize,
+    #[serde(default = "default_rescue_command")]
+    rescue_command: Vec<String>,
     groups: BTreeMap<String, RawGroup>,
 }
 
@@ -208,6 +229,10 @@ struct RawGroup {
     after: Vec<String>,
     #[serde(default)]
     conflicts: Vec<String>,
+}
+
+fn default_rescue_command() -> Vec<String> {
+    vec!["/bin/sh".into()]
 }
 
 const fn default_max_starting() -> usize {

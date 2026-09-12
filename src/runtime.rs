@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -126,6 +127,15 @@ pub enum RuntimeError {
     ApplyInProgress,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ApplyPlan {
+    pub start: Vec<String>,
+    pub stop: Vec<String>,
+    pub restart: Vec<String>,
+    pub update: Vec<String>,
+    pub remove: Vec<String>,
+}
+
 pub struct RuntimeEngine {
     snapshot: Arc<ConfigSnapshot>,
     services: BTreeMap<ServiceId, ServiceRuntime>,
@@ -182,34 +192,15 @@ impl RuntimeEngine {
         if self.pending_apply.is_some() {
             return Err(RuntimeError::ApplyInProgress);
         }
-        let mut affected = self
-            .snapshot
-            .services()
-            .keys()
-            .chain(snapshot.services().keys())
-            .filter(|service| {
-                self.snapshot.services().get(*service) != snapshot.services().get(*service)
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let affected = self.affected_services(&snapshot);
         if affected.is_empty() {
             self.snapshot = snapshot;
-            return Ok(self.reconcile_default(now_ms));
-        }
-        loop {
-            let previous = affected.len();
             for service in self.snapshot.services().keys() {
-                if self
-                    .required_services(service)
-                    .iter()
-                    .any(|required| affected.contains(required))
-                {
-                    affected.insert(service.clone());
-                }
+                self.services.entry(service.clone()).or_default();
             }
-            if affected.len() == previous {
-                break;
-            }
+            self.services
+                .retain(|service, _| self.snapshot.services().contains_key(service));
+            return Ok(self.reconcile_default(now_ms));
         }
         for service in &affected {
             if let Some(runtime) = self.services.get_mut(service) {
@@ -222,6 +213,119 @@ impl RuntimeEngine {
         let mut effects = self.schedule_stops();
         effects.extend(self.advance_pending_apply(now_ms));
         Ok(effects)
+    }
+
+    /// Builds the same reconciliation plan used by apply without changing state.
+    #[must_use]
+    pub fn plan_snapshot(&self, snapshot: &ConfigSnapshot) -> ApplyPlan {
+        let affected = self.affected_services(snapshot);
+        let enabled = snapshot
+            .activation_services(snapshot.default_group())
+            .unwrap_or_default();
+        let mut plan = ApplyPlan::default();
+        let all = self
+            .snapshot
+            .services()
+            .keys()
+            .chain(snapshot.services().keys())
+            .collect::<BTreeSet<_>>();
+        for service in all {
+            let running = self.status(service).is_some_and(|status| {
+                matches!(
+                    status.observed,
+                    ObservedState::Active | ObservedState::Starting | ObservedState::Stopping
+                )
+            });
+            let needs_stop = running && (!enabled.contains(service) || affected.contains(service));
+            let needs_start = enabled.contains(service) && (!running || affected.contains(service));
+            match (needs_stop, needs_start) {
+                (true, true) => plan.restart.push(service.to_string()),
+                (true, false) => plan.stop.push(service.to_string()),
+                (false, true) => plan.start.push(service.to_string()),
+                _ => {}
+            }
+            if !snapshot.services().contains_key(service) {
+                plan.remove.push(service.to_string());
+            } else if self.snapshot.services().get(service) != snapshot.services().get(service) {
+                plan.update.push(service.to_string());
+            }
+        }
+        plan
+    }
+
+    fn affected_services(&self, snapshot: &ConfigSnapshot) -> BTreeSet<ServiceId> {
+        let mut affected = self
+            .snapshot
+            .services()
+            .keys()
+            .filter(|service| match snapshot.services().get(*service) {
+                Some(new) => {
+                    let old = &self.snapshot.services()[*service];
+                    old.process != new.process || old.actions != new.actions || old.io != new.io
+                }
+                None => true,
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        loop {
+            let previous = affected.len();
+            for service in self.snapshot.services().keys() {
+                if self
+                    .required_services(service)
+                    .iter()
+                    .any(|id| affected.contains(id))
+                {
+                    affected.insert(service.clone());
+                }
+            }
+            if affected.len() == previous {
+                return affected;
+            }
+        }
+    }
+
+    /// Forces every currently requested stop to begin with SIGKILL.
+    #[must_use]
+    fn force_stopping(&self) -> Vec<RuntimeEffect> {
+        self.services
+            .iter()
+            .filter(|(_, runtime)| {
+                runtime.observed == ObservedState::Stopping
+                    && runtime.stop_signal == StopSignal::Kill
+            })
+            .map(|(service, runtime)| RuntimeEffect::Terminate {
+                service: service.clone(),
+                generation: runtime.generation,
+                force: true,
+            })
+            .collect()
+    }
+
+    /// Returns a terminal failure chain in the required part of the boot graph.
+    #[must_use]
+    pub fn boot_failure(&self) -> Option<String> {
+        let mut pending = VecDeque::from([(self.snapshot.default_group().clone(), Vec::new())]);
+        let mut visited = BTreeSet::new();
+        while let Some((target, mut chain)) = pending.pop_front() {
+            if !visited.insert(target.clone()) {
+                continue;
+            }
+            chain.push(target.to_string());
+            if self.status(&target).is_some_and(|status| {
+                status.desired == DesiredState::Active && status.observed == ObservedState::Failed
+            }) {
+                return Some(chain.join(" -> "));
+            }
+            if let Some(dependencies) = self.snapshot.dependencies(&target) {
+                pending.extend(
+                    dependencies
+                        .requires
+                        .iter()
+                        .map(|id| (id.clone(), chain.clone())),
+                );
+            }
+        }
+        None
     }
 
     #[must_use]
@@ -306,6 +410,7 @@ impl RuntimeEngine {
                 runtime.queued_at_ms = Some(now_ms);
             }
             runtime.desired = DesiredState::Active;
+            runtime.stop_signal = StopSignal::Term;
             runtime.restart_blocked = false;
             runtime.blocked_by = None;
             if runtime.observed == ObservedState::Failed && !runtime.has_process {
@@ -324,6 +429,18 @@ impl RuntimeEngine {
     ///
     /// Returns [`RuntimeError::UnknownTarget`] when the target is absent.
     pub fn stop(&mut self, target: &ServiceId) -> Result<Vec<RuntimeEffect>, RuntimeError> {
+        self.stop_with_force(target, false)
+    }
+
+    /// Requests an ordered stop, optionally bypassing helpers and SIGTERM.
+    ///
+    /// # Errors
+    /// Returns an error when the target is absent.
+    pub fn stop_with_force(
+        &mut self,
+        target: &ServiceId,
+        force: bool,
+    ) -> Result<Vec<RuntimeEffect>, RuntimeError> {
         let mut stopping = if self.snapshot.groups().contains_key(target) {
             self.snapshot
                 .activation_services(target)
@@ -355,11 +472,24 @@ impl RuntimeEngine {
                 continue;
             };
             runtime.desired = DesiredState::Inactive;
+            runtime.stop_signal = if force {
+                StopSignal::Kill
+            } else {
+                StopSignal::Term
+            };
             runtime.restart_blocked = false;
             runtime.waiting_restart = false;
             runtime.blocked_by = None;
         }
-        Ok(self.schedule_stops())
+        let mut effects = self.schedule_stops();
+        if force {
+            for effect in self.force_stopping() {
+                if !effects.contains(&effect) {
+                    effects.push(effect);
+                }
+            }
+        }
+        Ok(effects)
     }
 
     #[must_use]
@@ -767,7 +897,12 @@ impl RuntimeEngine {
             if runtime.has_process {
                 runtime.observed = ObservedState::Stopping;
                 runtime.stop_result = StopResult::Inactive;
-                effects.extend(terminate_effects(&service, runtime, false, stop_timeout_ms));
+                effects.extend(terminate_effects(
+                    &service,
+                    runtime,
+                    runtime.stop_signal == StopSignal::Kill,
+                    stop_timeout_ms,
+                ));
             } else {
                 runtime.observed = ObservedState::Inactive;
             }
@@ -801,7 +936,12 @@ impl RuntimeEngine {
             if runtime.has_process {
                 runtime.observed = ObservedState::Stopping;
                 runtime.stop_result = StopResult::Failed;
-                effects.extend(terminate_effects(&service, runtime, false, stop_timeout_ms));
+                effects.extend(terminate_effects(
+                    &service,
+                    runtime,
+                    runtime.stop_signal == StopSignal::Kill,
+                    stop_timeout_ms,
+                ));
             } else {
                 runtime.observed = ObservedState::Failed;
             }
@@ -957,12 +1097,19 @@ struct PendingApply {
     affected: BTreeSet<ServiceId>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopSignal {
+    Term,
+    Kill,
+}
+
 #[derive(Clone, Debug)]
 struct ServiceRuntime {
     desired: DesiredState,
     observed: ObservedState,
     generation: u64,
     has_process: bool,
+    stop_signal: StopSignal,
     waiting_restart: bool,
     restart_blocked: bool,
     blocked_by: Option<ServiceId>,
@@ -982,6 +1129,7 @@ impl Default for ServiceRuntime {
             observed: ObservedState::Inactive,
             generation: 0,
             has_process: false,
+            stop_signal: StopSignal::Term,
             waiting_restart: false,
             restart_blocked: false,
             blocked_by: None,
@@ -1408,5 +1556,66 @@ mod tests {
             effect,
             RuntimeEffect::Terminate { service, .. } if service.as_str() == "db"
         )));
+    }
+    #[test]
+    fn force_stop_preserves_dependency_order_and_escalates_pending_stop() {
+        let db = simple("");
+        let web = simple("[dependencies]\nrequires = [\"db\"]");
+        let mut engine = RuntimeEngine::new(snapshot(&[("db", &db), ("web", &web)], &["web"]));
+        let effects = engine.start(&ServiceId::new("boot").unwrap(), 0).unwrap();
+        let db_generation = spawns(&effects, "db").unwrap();
+        let effects = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: ServiceId::new("db").unwrap(),
+            generation: db_generation,
+            at_ms: 1,
+        });
+        let web_generation = spawns(&effects, "web").unwrap();
+        let _ = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: ServiceId::new("web").unwrap(),
+            generation: web_generation,
+            at_ms: 2,
+        });
+        let _ = engine.stop(&ServiceId::new("db").unwrap()).unwrap();
+        let effects = engine
+            .stop_with_force(&ServiceId::new("db").unwrap(), true)
+            .unwrap();
+        assert!(effects.iter().any(|effect| matches!(effect, RuntimeEffect::Terminate { service, force: true, .. } if service.as_str() == "web")));
+        assert!(!effects.iter().any(|effect| matches!(effect, RuntimeEffect::Terminate { service, .. } if service.as_str() == "db")));
+        let effects = engine.handle(RuntimeEvent::Exited {
+            service: ServiceId::new("web").unwrap(),
+            generation: web_generation,
+            outcome: ExitOutcome::Signal(9),
+            at_ms: 3,
+        });
+        assert!(effects.iter().any(|effect| matches!(effect, RuntimeEffect::Terminate { service, force: true, .. } if service.as_str() == "db")));
+    }
+
+    #[test]
+    fn only_required_boot_failures_enter_rescue() {
+        for (relation, required) in [("requires", true), ("wants", false)] {
+            let manager = format!(
+                "schema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\n{relation} = [\"broken\"]\n"
+            );
+            let source = simple("type = \"oneshot\"");
+            let config = ConfigSnapshot::build(
+                &manager,
+                [(ServiceId::new("broken").unwrap(), source.as_str())],
+                ManagerScope::System,
+            )
+            .unwrap();
+            let mut engine = RuntimeEngine::new(Arc::new(config));
+            let effects = engine.start(&ServiceId::new("boot").unwrap(), 0).unwrap();
+            let generation = spawns(&effects, "broken").unwrap();
+            let _ = engine.handle(RuntimeEvent::Exited {
+                service: ServiceId::new("broken").unwrap(),
+                generation,
+                outcome: ExitOutcome::ExitCode(1),
+                at_ms: 1,
+            });
+            assert_eq!(
+                engine.boot_failure(),
+                required.then(|| "boot -> broken".into())
+            );
+        }
     }
 }

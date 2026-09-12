@@ -5,7 +5,7 @@ use std::{env, ffi::OsString, fs, path::PathBuf, process::ExitCode};
 use lexopt::prelude::*;
 use loom::{
     config_edit::atomic_write,
-    linux::{mount_api_filesystems, rescue_loop, shutdown_system},
+    linux::{mount_api_filesystems, notify_launcher, rescue_loop, shutdown_system},
     loader::ConfigLoader,
     manager::{Manager, ManagerMode, ManagerOptions, ShutdownAction},
     sage::compile_service,
@@ -31,8 +31,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut command = None;
     let mut sage_input = None;
     let mut output = None;
+    let mut ready_fd = None;
     while let Some(argument) = parser.next()? {
         match argument {
+            Long("ready-fd") => ready_fd = Some(parser.value()?.to_string_lossy().parse::<i32>()?),
             Long("user") => mode = ManagerMode::User,
             Long("system") => mode = ManagerMode::System,
             Long("root") => root = parser.value()?.into(),
@@ -89,7 +91,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let action = Manager::new(options)?.run()?;
+    if ready_fd.is_some() && mode != ManagerMode::User {
+        return Err("--ready-fd is restricted to user managers".into());
+    }
+    let manager = Manager::new(options)?;
+    if let Some(fd) = ready_fd {
+        notify_launcher(fd)?;
+    }
+    let action = manager.run()?;
     if mode == ManagerMode::System && std::process::id() == 1 {
         match action {
             ShutdownAction::Reboot => shutdown_system(true)?,

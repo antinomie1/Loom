@@ -28,20 +28,27 @@ the systemd unit or D-Bus interfaces.
 Implementation is in progress. Native TOML validation, dependency scheduling,
 pidfd/cgroup supervision, the epoll manager, user instances, the local control
 protocol, PID-1 API mounts/rescue, and Sage service compilation are implemented.
-A minimal PID-1 QEMU smoke suite is included; the comparative boot benchmark
-and full Sage image fixture remain.
+Recovery keeps the control interface available; helpers run asynchronously and
+stop waits for the complete process domain. Dry-run plans, structured TOML
+reports, forced stop and installed-layout user-manager startup are supported.
+A minimal PID-1 QEMU regression suite covers recovery, process cleanup and
+ordered shutdown. The complete Sage image fixture and comparative performance
+acceptance results remain outstanding.
 
 ```sh
 cargo build --release
 cargo test --all-targets
 # With a pinned local kernel:
 tests/qemu/boot.sh /path/to/bzImage
+tests/qemu/regression.sh /path/to/bzImage
 
 # User manager is started automatically when needed.
 loomctl --user status
 loomctl --user start example
 loomctl --user timings
 loomctl --user critical-path
+loomctl --user apply --dry-run --format toml
+loomctl --user enable --now example
 ```
 
 See [the ADR index](docs/adr/README.md) and [glossary](docs/GLOSSARY.md).
