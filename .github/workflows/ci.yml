@@ -31,6 +31,7 @@ jobs:
             https://snapshot.ubuntu.com/ubuntu/20260828T000000Z/pool/main/l/linux-signed/linux-image-6.8.0-138-generic_6.8.0-138.138_amd64.deb \
             --output "$RUNNER_TEMP/loom-kernel.deb"
           echo "7093879c9dad61fb24bb5a0247d8dd1ea444c4854492a9b3669175624cd04bda  $RUNNER_TEMP/loom-kernel.deb" | sha256sum --check
+          mkdir -p target/qemu/kernel
           dpkg-deb --extract "$RUNNER_TEMP/loom-kernel.deb" target/qemu/kernel
       - run: tests/qemu/build-initramfs.sh
       - name: Boot, recover, and shut down as PID 1
