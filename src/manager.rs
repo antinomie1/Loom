@@ -278,25 +278,25 @@ impl Manager {
         }
 
         loop {
-            if self.options.mode == ManagerMode::System && !self.boot_checked {
+            if self.options.mode == ManagerMode::System && self.rescue.is_none() {
                 if let Some(chain) = self.engine.boot_failure() {
                     self.enter_rescue(format!("required boot chain failed: {chain}"))?;
                     self.boot_checked = true;
-                } else if self
-                    .engine
-                    .snapshot()
-                    .activation_services(self.engine.snapshot().default_group())
-                    .is_some_and(|services| {
-                        services.iter().all(|id| {
-                            self.engine.status(id).is_some_and(|status| {
-                                matches!(
-                                    status.observed,
-                                    ObservedState::Active | ObservedState::Failed
-                                )
+                } else if !self.boot_checked
+                    && self
+                        .engine
+                        .snapshot()
+                        .activation_services(self.engine.snapshot().default_group())
+                        .is_some_and(|services| {
+                            services.iter().all(|id| {
+                                self.engine.status(id).is_some_and(|status| {
+                                    matches!(
+                                        status.observed,
+                                        ObservedState::Active | ObservedState::Failed
+                                    )
+                                })
                             })
                         })
-                    })
-                    && self.rescue.is_none()
                 {
                     self.boot_checked = true;
                 }

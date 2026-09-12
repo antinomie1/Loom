@@ -131,14 +131,14 @@ type = "oneshot"
 CONFIG
 log_dir="$repo/target/qemu/regression"
 mkdir -p "$log_dir"
-for scenario in healthy invalid-config required-failure required-exec-failure; do
+for scenario in healthy invalid-config required-failure required-exec-failure required-clean-exit; do
     cp "$root/bin/real-sh" "$root/bin/sh"
     case $scenario in
         healthy)
             marker=LOOM_REGRESSION_OK
             boot='wants = ["driver"]'
             ;;
-        required-failure | required-exec-failure)
+        required-failure | required-exec-failure | required-clean-exit)
             marker=LOOM_RESCUE_OK
             boot='requires = ["broken"]'
             ;;
@@ -158,6 +158,13 @@ SHELL
 schema_version = 1
 [process]
 command = ["/missing-executable"]
+CONFIG
+    fi
+    if [ "$scenario" = required-clean-exit ]; then
+        cat >"$root/etc/loom/services/broken.toml" <<'CONFIG'
+schema_version = 1
+[process]
+command = ["/bin/true"]
 CONFIG
     fi
     cat >"$root/etc/loom/loom.toml" <<CONFIG

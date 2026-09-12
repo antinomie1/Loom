@@ -311,8 +311,10 @@ impl RuntimeEngine {
                 continue;
             }
             chain.push(target.to_string());
-            if self.status(&target).is_some_and(|status| {
-                status.desired == DesiredState::Active && status.observed == ObservedState::Failed
+            if self.services.get(&target).is_some_and(|runtime| {
+                runtime.desired == DesiredState::Active
+                    && (runtime.observed == ObservedState::Failed
+                        || (runtime.observed == ObservedState::Inactive && runtime.restart_blocked))
             }) {
                 return Some(chain.join(" -> "));
             }
@@ -851,6 +853,7 @@ impl RuntimeEngine {
             let definition = &self.snapshot.services()[&service];
             let runtime = self.services.get_mut(&service).expect("known service");
             runtime.generation = runtime.generation.wrapping_add(1).max(1);
+            runtime.stop_signal = StopSignal::Term;
             runtime.observed = ObservedState::Starting;
             runtime.has_process = true;
             runtime.started_at_ms = now_ms;
@@ -1591,6 +1594,44 @@ mod tests {
     }
 
     #[test]
+    fn fresh_attempt_clears_a_previous_forced_stop() {
+        let service = simple("");
+        let id = ServiceId::new("svc").unwrap();
+        let mut engine = RuntimeEngine::new(snapshot(&[("svc", &service)], &["svc"]));
+        let effects = engine.start(&ServiceId::new("boot").unwrap(), 0).unwrap();
+        let generation = spawns(&effects, "svc").unwrap();
+        let _ = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: id.clone(),
+            generation,
+            at_ms: 1,
+        });
+        let _ = engine.stop_with_force(&id, true).unwrap();
+        let _ = engine.handle(RuntimeEvent::Exited {
+            service: id.clone(),
+            generation,
+            outcome: ExitOutcome::Signal(9),
+            at_ms: 2,
+        });
+
+        let effects = engine.restart(&id, 3).unwrap();
+        let next = spawns(&effects, "svc").unwrap();
+        let _ = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: id,
+            generation: next,
+            at_ms: 4,
+        });
+        let effects = engine.stop_all();
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            RuntimeEffect::Terminate {
+                service,
+                generation,
+                force: false,
+            } if service.as_str() == "svc" && *generation == next
+        )));
+    }
+
+    #[test]
     fn only_required_boot_failures_enter_rescue() {
         for (relation, required) in [("requires", true), ("wants", false)] {
             let manager = format!(
@@ -1617,5 +1658,32 @@ mod tests {
                 required.then(|| "boot -> broken".into())
             );
         }
+    }
+
+    #[test]
+    fn required_simple_service_clean_exit_is_a_boot_failure() {
+        let manager = "schema_version = 1\ndefault_group = \"boot\"\n[groups.boot]\nrequires = [\"daemon\"]\n";
+        let source = simple("");
+        let config = ConfigSnapshot::build(
+            manager,
+            [(ServiceId::new("daemon").unwrap(), source.as_str())],
+            ManagerScope::System,
+        )
+        .unwrap();
+        let mut engine = RuntimeEngine::new(Arc::new(config));
+        let effects = engine.start(&ServiceId::new("boot").unwrap(), 0).unwrap();
+        let generation = spawns(&effects, "daemon").unwrap();
+        let _ = engine.handle(RuntimeEvent::ExecSucceeded {
+            service: ServiceId::new("daemon").unwrap(),
+            generation,
+            at_ms: 1,
+        });
+        let _ = engine.handle(RuntimeEvent::Exited {
+            service: ServiceId::new("daemon").unwrap(),
+            generation,
+            outcome: ExitOutcome::Success,
+            at_ms: 2,
+        });
+        assert_eq!(engine.boot_failure().as_deref(), Some("boot -> daemon"));
     }
 }
