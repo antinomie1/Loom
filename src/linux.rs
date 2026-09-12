@@ -1005,21 +1005,39 @@ mod tests {
 
     #[test]
     fn passes_nonblocking_notify_socket() {
+        // Other tests can release low-numbered descriptors after we reserve
+        // ours. Run this descriptor-sensitive check in a fresh test process.
+        if std::env::var_os("LOOM_TEST_NOTIFY_ISOLATED").is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "linux::tests::passes_nonblocking_notify_socket",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env("LOOM_TEST_NOTIFY_ISOLATED", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "isolated notify test failed");
+            return;
+        }
         // Keep the notification descriptor above 9: POSIX shell redirections
         // are not a portable way to write to arbitrary inherited descriptors.
         let _held = (0..16)
             .map(|_| File::open("/dev/null").unwrap())
             .collect::<Vec<_>>();
         let executable = std::env::current_exe().unwrap();
-        let service = definition(
+        let mut service = definition(
             &[
                 executable.to_str().unwrap(),
                 "--exact",
                 "linux::tests::notify_child_helper",
                 "--test-threads=1",
+                "--nocapture",
             ],
             "notify",
         );
+        service.io.stderr = OutputTarget::Console;
         let environment = BTreeMap::from([("LOOM_TEST_NOTIFY_CHILD".into(), "1".into())]);
         let mut process = SpawnedProcess::spawn(&service, None, &environment, None).unwrap();
 
@@ -1031,7 +1049,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(1));
         }
-        let _ = process.wait().unwrap();
+        assert!(process.wait().unwrap().success(), "notify helper failed");
         assert_eq!(notification, NotificationRead::Message(b"READY".to_vec()));
     }
 
